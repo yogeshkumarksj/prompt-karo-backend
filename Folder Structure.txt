@@ -1,0 +1,6 @@
+prompt_verse_backend/
+├── main.py            # API का एंट्री पॉइंट
+├── database.py        # DB Connection सेटअप
+├── models.py          # Database Tables (Schema)
+├── schemas.py         # Pydantic Models (Data Validation)
+└── .env               # Secrets (DB URL, API Keys)

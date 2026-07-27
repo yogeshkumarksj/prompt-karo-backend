@@ -3,6 +3,7 @@ from typing import List, Optional
 from datetime import datetime
 
 # --- Category Schemas (Pydantic) ---
+# यहाँ 'BaseModel' का इस्तेमाल होगा, 'Base' का नहीं
 class CategoryBase(BaseModel):
     name: str
 

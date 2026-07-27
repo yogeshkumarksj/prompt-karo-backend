@@ -18,7 +18,7 @@ class PromptBase(BaseModel):
     title: str
     prompt_text: str
     image_url: str
-    category_id: int
+    category: int
     tags: Optional[str] = None
 
 class PromptCreate(PromptBase):

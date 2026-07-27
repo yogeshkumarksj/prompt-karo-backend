@@ -12,5 +12,5 @@ class Prompt(Base):
     title = Column(String, index=True)
     prompt_text = Column(Text)
     image_url = Column(String)
-    category_id = Column(Integer, ForeignKey("categories.id"))
+    category = Column(String, default="General")
     tags = Column(String) # "anime,4k,warrior"

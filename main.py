@@ -1,13 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware 
+from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List
 import models, schemas, crud
 from database import engine, get_db
 
-app = FastAPI(title="PromptVerse API")
+app = FastAPI(title="Prompt Karo API")
 
-# CORS Middleware (इसे सबसे ऊपर रखें)
+# 1. CORS Settings (Web Admin के लिए बहुत ज़रूरी)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,27 +17,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database Tables बनाना
 models.Base.metadata.create_all(bind=engine)
+
+ADMIN_KEY = "promptverse_admin_secret_786"
+
+def verify_admin(x_admin_key: str = Header(None)):
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid Admin Key")
+    return True
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to PromptVerse API - Live!"}
+    return {"message": "API is Live!"}
 
-# --- Category Endpoints ---
+# --- PROMPTS ---
+@app.get("/prompts/", response_model=List[schemas.Prompt])
+def read_prompts(search: str = None, category: str = None, sort_by: str = None, db: Session = Depends(get_db)):
+    return crud.get_prompts(db, search=search, category=category, sort_by=sort_by)
+
+@app.post("/prompts/", response_model=schemas.Prompt)
+def create_prompt(prompt: schemas.PromptCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    return crud.create_prompt(db=db, prompt=prompt)
+
+@app.delete("/prompts/{prompt_id}")
+def delete_prompt(prompt_id: int, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
+    if not db_prompt: raise HTTPException(status_code=404)
+    db.delete(db_prompt)
+    db.commit()
+    return {"message": "Deleted"}
+
+# --- CATEGORIES ---
 @app.get("/categories/", response_model=List[schemas.Category])
 def read_categories(db: Session = Depends(get_db)):
     return crud.get_categories(db)
 
 @app.post("/categories/", response_model=schemas.Category)
-def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db)):
+def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
     return crud.create_category(db=db, category=category)
 
-# --- Prompt Endpoints ---
-@app.get("/prompts/", response_model=List[schemas.Prompt])
-def read_prompts(search: str = None, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return crud.get_prompts(db, skip=skip, limit=limit, search=search)
+# --- NEW: Category with Count (जो एरर दे रहा था) ---
+@app.get("/categories/with-count/")
+def get_categories_with_count(db: Session = Depends(get_db)):
+    categories = db.query(models.Category).all()
+    result = []
+    for cat in categories:
+        count = db.query(models.Prompt).filter(models.Prompt.category == cat.name).count()
+        result.append({"id": cat.id, "name": cat.name, "prompt_count": count})
+    return result
 
-@app.post("/prompts/", response_model=schemas.Prompt)
-def create_prompt(prompt: schemas.PromptCreate, db: Session = Depends(get_db)):
-    return crud.create_prompt(db=db, prompt=prompt)
+# --- NEW: Admin Stats (जो एरer दे रहा था) ---
+@app.get("/admin/stats/")
+def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    total_prompts = db.query(models.Prompt).count()
+    total_views = db.query(func.sum(models.Prompt.views)).scalar() or 0
+    total_copies = db.query(func.sum(models.Prompt.copies)).scalar() or 0
+    total_shares = db.query(func.sum(models.Prompt.shares)).scalar() or 0
+    return {
+        "total_prompts": total_prompts,
+        "total_views": total_views,
+        "total_copies": total_copies,
+        "total_shares": total_shares
+    }
+
+# --- SETTINGS (जो एरर दे रहा था) ---
+@app.get("/settings/")
+def get_settings(db: Session = Depends(get_db)):
+    settings = db.query(models.AppSetting).all()
+    return {s.config_key: s.config_value for s in settings}
+
+@app.post("/settings/")
+def update_setting(key: str, value: str, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    setting = db.query(models.AppSetting).filter(models.AppSetting.config_key == key).first()
+    if setting: setting.config_value = value
+    else:
+        setting = models.AppSetting(config_key=key, config_value=value)
+        db.add(setting)
+    db.commit()
+    return {"status": "success"}

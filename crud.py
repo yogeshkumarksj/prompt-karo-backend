@@ -2,14 +2,31 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc, asc
 import models, schemas
 
+# --- CATEGORIES LOGIC ---
+
+def get_categories(db: Session):
+    """सभी कैटेगरीज की लिस्ट लाने के लिए (यही फंक्शन मिसिंग था)"""
+    return db.query(models.Category).all()
+
+def create_category(db: Session, category: schemas.CategoryCreate):
+    """नई कैटेगरी बनाने के लिए"""
+    db_category = models.Category(name=category.name)
+    db.add(db_category)
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+# --- PROMPTS LOGIC ---
+
 def get_prompts(db: Session, skip: int = 0, limit: int = 100, search: str = None, category: str = None, sort_by: str = None):
+    """प्रॉम्ट्स को फिल्टर और सॉर्ट करके लाने के लिए"""
     query = db.query(models.Prompt)
     
-    # 1. कैटेगरी फिल्टर (अगर 'All' नहीं है)
+    # 1. कैटेगरी फिल्टर
     if category and category != "All":
         query = query.filter(models.Prompt.category == category)
         
-    # 2. सर्च फिल्टर (Title या Prompt Text में)
+    # 2. सर्च फिल्टर
     if search:
         query = query.filter(
             or_(
@@ -18,7 +35,7 @@ def get_prompts(db: Session, skip: int = 0, limit: int = 100, search: str = None
             )
         )
 
-    # 3. सॉर्टिंग (Sorting) लॉजिक
+    # 3. सॉर्टिंग लॉजिक
     if sort_by == "views_high":
         query = query.order_by(desc(models.Prompt.views))
     elif sort_by == "views_low":
@@ -28,9 +45,28 @@ def get_prompts(db: Session, skip: int = 0, limit: int = 100, search: str = None
     elif sort_by == "shares_high":
         query = query.order_by(desc(models.Prompt.shares))
     else:
-        # डिफ़ॉल्ट: नया प्रॉम्ट सबसे ऊपर (Newest First)
         query = query.order_by(desc(models.Prompt.id))
 
     return query.offset(skip).limit(limit).all()
 
-# बाकी के फंक्शन्स (create_prompt, get_categories आदि) नीचे वैसे ही रहेंगे...
+def create_prompt(db: Session, prompt: schemas.PromptCreate):
+    """नया प्रॉम्ट डेटाबेस में डालने के लिए"""
+    db_prompt = models.Prompt(**prompt.dict())
+    db.add(db_prompt)
+    db.commit()
+    db.refresh(db_prompt)
+    return db_prompt
+
+# --- SOURCES LOGIC ---
+
+def get_sources(db: Session):
+    """स्क्रैपिंग सोर्सेज की लिस्ट लाने के लिए"""
+    return db.query(models.Source).all()
+
+def create_source(db: Session, source: schemas.SourceCreate):
+    """नया सोर्स जोड़ने के लिए"""
+    db_source = models.Source(**source.dict())
+    db.add(db_source)
+    db.commit()
+    db.refresh(db_source)
+    return db_source

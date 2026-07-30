@@ -8,14 +8,15 @@ from database import engine, get_db
 
 app = FastAPI(title="Prompt Karo API")
 
-# 1. CORS Settings (Web Admin के लिए बहुत ज़रूरी)
+# 1. CORS Settings (ब्रैकेट की गलती यहाँ ठीक कर दी गई है)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # सभी वेबसाइट्स को अनुमति दें
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"], # GET, POST, DELETE, OPTIONS सब अलाउड
-    allow_headers=["*"], # सभी हेडर्स अलाउड
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
 models.Base.metadata.create_all(bind=engine)
 
 ADMIN_KEY = "promptverse_admin_secret_786"
@@ -27,7 +28,7 @@ def verify_admin(x_admin_key: str = Header(None)):
 
 @app.get("/")
 def read_root():
-    return {"message": "API is Live!"}
+    return {"message": "API is Live and Working!"}
 
 # --- PROMPTS ---
 @app.get("/prompts/", response_model=List[schemas.Prompt])
@@ -46,16 +47,24 @@ def delete_prompt(prompt_id: int, db: Session = Depends(get_db), authenticated: 
     db.commit()
     return {"message": "Deleted"}
 
+# --- ANALYTICS (Increment View/Copy/Share) ---
+@app.post("/prompts/{prompt_id}/increment/{action}")
+def increment_stat(prompt_id: int, action: str, db: Session = Depends(get_db)):
+    db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
+    if not db_prompt: raise HTTPException(status_code=404)
+    
+    if action == "view": db_prompt.views += 1
+    elif action == "copy": db_prompt.copies += 1
+    elif action == "share": db_prompt.shares += 1
+    
+    db.commit()
+    return {"status": "success"}
+
 # --- CATEGORIES ---
 @app.get("/categories/", response_model=List[schemas.Category])
 def read_categories(db: Session = Depends(get_db)):
     return crud.get_categories(db)
 
-@app.post("/categories/", response_model=schemas.Category)
-def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
-    return crud.create_category(db=db, category=category)
-
-# --- NEW: Category with Count (जो एरर दे रहा था) ---
 @app.get("/categories/with-count/")
 def get_categories_with_count(db: Session = Depends(get_db)):
     categories = db.query(models.Category).all()
@@ -65,7 +74,11 @@ def get_categories_with_count(db: Session = Depends(get_db)):
         result.append({"id": cat.id, "name": cat.name, "prompt_count": count})
     return result
 
-# --- NEW: Admin Stats (जो एरer दे रहा था) ---
+@app.post("/categories/", response_model=schemas.Category)
+def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    return crud.create_category(db=db, category=category)
+
+# --- ADMIN STATS ---
 @app.get("/admin/stats/")
 def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
     total_prompts = db.query(models.Prompt).count()
@@ -79,7 +92,7 @@ def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends
         "total_shares": total_shares
     }
 
-# --- SETTINGS (जो एरर दे रहा था) ---
+# --- SETTINGS ---
 @app.get("/settings/")
 def get_settings(db: Session = Depends(get_db)):
     settings = db.query(models.AppSetting).all()

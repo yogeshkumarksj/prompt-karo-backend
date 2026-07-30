@@ -15,7 +15,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"], # GET, POST, DELETE, OPTIONS सब अलाउड
     allow_headers=["*"], # सभी हेडर्स अलाउड
-
+)
 models.Base.metadata.create_all(bind=engine)
 
 ADMIN_KEY = "promptverse_admin_secret_786"

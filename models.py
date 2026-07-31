@@ -20,3 +20,11 @@ class Prompt(Base):
     copies = Column(Integer, default=0)
     shares = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# models.py में सबसे नीचे यह जोड़ें
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    id = Column(Integer, primary_key=True, index=True)
+    config_key = Column(String, unique=True, index=True)
+    config_value = Column(String)

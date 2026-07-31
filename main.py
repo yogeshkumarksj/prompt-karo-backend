@@ -124,3 +124,7 @@ def update_prompt(prompt_id: int, prompt: schemas.PromptCreate, db: Session = De
     db.commit()
     db.refresh(db_prompt)
     return db_prompt
+#----------Source----------
+@app.get("/sources/")
+def get_sources(db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    return crud.get_sources(db)

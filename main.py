@@ -93,12 +93,12 @@ def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends
     }
 
 # --- SETTINGS ---
-@app.get("/settings/")
+@app.get("/settings")
 def get_settings(db: Session = Depends(get_db)):
     settings = db.query(models.AppSetting).all()
     return {s.config_key: s.config_value for s in settings}
 
-@app.post("/settings/")
+@app.post("/settings")
 def update_setting(key: str, value: str, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
     setting = db.query(models.AppSetting).filter(models.AppSetting.config_key == key).first()
     if setting: setting.config_value = value

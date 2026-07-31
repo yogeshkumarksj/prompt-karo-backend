@@ -6,7 +6,7 @@ from typing import List
 import models, schemas, crud
 from database import engine, get_db
 
-app = FastAPI(title="Prompt Karo API")
+app = FastAPI(title="Antim Prompt")
 
 # 1. CORS Settings (ब्रैकेट की गलती यहाँ ठीक कर दी गई है)
 app.add_middleware(

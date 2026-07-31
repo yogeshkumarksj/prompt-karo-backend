@@ -107,3 +107,20 @@ def update_setting(key: str, value: str, db: Session = Depends(get_db), authenti
         db.add(setting)
     db.commit()
     return {"status": "success"}
+#-----------Edit prompt-----------
+
+@app.put("/prompts/{prompt_id}") # PUT मेथड डेटा अपडेट करने के लिए होता है
+def update_prompt(prompt_id: int, prompt: schemas.PromptCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+    db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
+    if not db_prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+    
+    # डेटा अपडेट करें
+    db_prompt.title = prompt.title
+    db_prompt.prompt_text = prompt.prompt_text
+    db_prompt.image_url = prompt.image_url
+    db_prompt.category = prompt.category
+    
+    db.commit()
+    db.refresh(db_prompt)
+    return db_prompt

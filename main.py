@@ -1,10 +1,13 @@
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header,UploadFile, File, Depends, Form,
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
 import models, schemas, crud
 from database import engine, get_db
+import shutil
+import os
 
 app = FastAPI(title="Antim Prompt")
 
@@ -128,3 +131,61 @@ def update_prompt(prompt_id: int, prompt: schemas.PromptCreate, db: Session = De
 @app.get("/sources/")
 def get_sources(db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
     return crud.get_sources(db)
+
+#'uploads' फोल्डर को पब्लिक करें
+UPLOAD_ROOT = "uploads"
+if not os.path.exists(UPLOAD_ROOT):
+    os.makedirs(UPLOAD_ROOT)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
+
+@app.post("/publish-prompt")
+async def publish_prompt(
+    title: str = Form(...),
+    prompt_text: str = Form(...),
+    category: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_admin)
+):
+    try:
+        # 1. पहले डेटाबेस में प्रॉम्ट सेव करें (ताकि ID मिल जाए)
+        new_prompt = models.Prompt(
+            title=title,
+            prompt_text=prompt_text,
+            category=category,
+            image_url="" # अभी खाली छोड़ें
+        )
+        db.add(new_prompt)
+        db.commit()
+        db.refresh(new_prompt)
+        
+        prompt_id = new_prompt.id
+
+        # 2. कैटेगरी के नाम का फोल्डर बनाएं (Sanitize category name)
+        safe_category = category.replace(" ", "_").lower()
+        category_dir = os.path.join(UPLOAD_ROOT, safe_category)
+        if not os.path.exists(category_dir):
+            os.makedirs(category_dir)
+
+        # 3. फाइल को रिनेम करें: prompt_id.extension
+        file_extension = file.filename.split(".")[-1]
+        file_name = f"{prompt_id}.{file_extension}"
+        file_location = os.path.join(category_dir, file_name)
+
+        # 4. फाइल को सेव करें
+        with open(file_location, "wb+") as file_object:
+            shutil.copyfileobj(file.file, file_object)
+
+        # 5. डेटाबेस में असली URL अपडेट करें
+        # 'https://api.antimprompt.com' को अपने असली डोमेन से बदलें
+        host_url = "https://prompt-karo-backend.onrender.com" 
+        final_url = f"{host_url}/uploads/{safe_category}/{file_name}"
+        
+        new_prompt.image_url = final_url
+        db.commit()
+
+        return {"status": "success", "url": final_url}
+
+    except Exception as e:
+        db.rollback() # अगर कुछ गड़बड़ हो तो DB बदलाव वापस लें
+        raise HTTPException(status_code=500, detail=str(e))

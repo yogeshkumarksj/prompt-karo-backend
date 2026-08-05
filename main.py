@@ -151,7 +151,7 @@ def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends
     }
 
 # --- SETTINGS ---
-@app.get("/settings")
+@app.get("/settings/")
 def get_settings(db: Session = Depends(get_db)):
     settings = db.query(models.AppSetting).all()
     if not settings: return {"timer_enabled": "false", "timer_seconds": "5"}

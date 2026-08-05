@@ -138,7 +138,7 @@ if not os.path.exists(UPLOAD_ROOT):
     os.makedirs(UPLOAD_ROOT)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
-@app.post("/publish-prompt")
+@app.post("/publish-prompt/")
 async def publish_prompt(
     title: str = Form(...),
     prompt_text: str = Form(...),

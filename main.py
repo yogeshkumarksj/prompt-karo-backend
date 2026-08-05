@@ -106,6 +106,31 @@ def delete_prompt(prompt_id: int, db: Session = Depends(get_db), authenticated: 
     db.delete(db_prompt)
     db.commit()
     return {"message": "Deleted"}
+    
+@app.put("/prompts/{prompt_id}/", response_model=schemas.Prompt)
+def update_prompt(
+    prompt_id: int, 
+    prompt: schemas.PromptCreate, 
+    db: Session = Depends(get_db), 
+    authenticated: bool = Depends(verify_admin)
+):
+    # 1. डेटाबेस में प्रॉम्ट ढूंढें
+    db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
+    
+    if not db_prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+    
+    # 2. डेटा अपडेट करें
+    db_prompt.title = prompt.title
+    db_prompt.prompt_text = prompt.prompt_text
+    db_prompt.image_url = prompt.image_url
+    db_prompt.category = prompt.category
+    
+    # 3. सेव करें
+    db.commit()
+    db.refresh(db_prompt)
+    return db_prompt
+
 
 # --- ANALYTICS ---
 @app.post("/prompts/{prompt_id}/increment/{action}")

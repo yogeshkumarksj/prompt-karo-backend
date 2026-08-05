@@ -27,7 +27,7 @@ if not os.path.exists(UPLOAD_ROOT):
     os.makedirs(UPLOAD_ROOT)
 
 # इसे 'Public' करें ताकि URL से इमेज दिखे
-app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
+app.mount("/uploads/", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 models.Base.metadata.create_all(bind=engine)
 

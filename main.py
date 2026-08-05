@@ -48,16 +48,18 @@ async def publish_prompt(
     title: str = Form(...),
     prompt_text: str = Form(...),
     category: str = Form(...),
+    tags: str = Form(None), # <--- यह नई लाइन जोड़ें (None मतलब यह optional है)
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     authenticated: bool = Depends(verify_admin)
 ):
     try:
-        # 1. पहले डेटाबेस में प्रॉम्ट सेव करें (ID पाने के लिए)
+        # 1. डेटाबेस में प्रॉम्ट सेव करें
         new_prompt = models.Prompt(
             title=title,
             prompt_text=prompt_text,
             category=category,
+            tags=tags, # <--- यहाँ tags को पास करें
             image_url="" 
         )
         db.add(new_prompt)

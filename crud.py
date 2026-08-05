@@ -57,6 +57,22 @@ def create_prompt(db: Session, prompt: schemas.PromptCreate):
     db.refresh(db_prompt)
     return db_prompt
 
+def get_prompts(db: Session, skip: int = 0, limit: int = 100, search: str = None, category: str = None, sort_by: str = None):
+    query = db.query(models.Prompt)
+    
+    if category and category != "All":
+        query = query.filter(models.Prompt.category == category)
+        
+    if search:
+        # अब यह Title, Prompt Text और TAGS तीनों में ढूंढेगा
+        query = query.filter(
+            or_(
+                models.Prompt.title.ilike(f"%{search}%"),
+                models.Prompt.prompt_text.ilike(f"%{search}%"),
+                models.Prompt.tags.ilike(f"%{search}%") # <--- यह लाइन जोड़ें
+            )
+        )
+        
 # --- SOURCES LOGIC ---
 
 def get_sources(db: Session):

@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, Header,UploadFile, File, Depends, Form,
+import shutil
+import os
+import time
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -6,12 +9,10 @@ from sqlalchemy import func
 from typing import List
 import models, schemas, crud
 from database import engine, get_db
-import shutil
-import os
 
-app = FastAPI(title="Antim Prompt")
+app = FastAPI(title="Antim Prompt API")
 
-# 1. CORS Settings (ब्रैकेट की गलती यहाँ ठीक कर दी गई है)
+# 1. CORS Settings
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +20,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 2. 'uploads' फोल्डर सेटअप
+UPLOAD_ROOT = "uploads"
+if not os.path.exists(UPLOAD_ROOT):
+    os.makedirs(UPLOAD_ROOT)
+
+# इसे 'Public' करें ताकि URL से इमेज दिखे
+app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -31,16 +40,64 @@ def verify_admin(x_admin_key: str = Header(None)):
 
 @app.get("/")
 def read_root():
-    return {"message": "API is Live and Working!"}
+    return {"message": "Antim Prompt API is Live!"}
+
+# --- NEW: Publish Prompt with File & ID-based Renaming ---
+@app.post("/publish-prompt/")
+async def publish_prompt(
+    title: str = Form(...),
+    prompt_text: str = Form(...),
+    category: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_admin)
+):
+    try:
+        # 1. पहले डेटाबेस में प्रॉम्ट सेव करें (ID पाने के लिए)
+        new_prompt = models.Prompt(
+            title=title,
+            prompt_text=prompt_text,
+            category=category,
+            image_url="" 
+        )
+        db.add(new_prompt)
+        db.commit()
+        db.refresh(new_prompt)
+        
+        prompt_id = new_prompt.id
+
+        # 2. कैटेगरी फोल्डर बनाएं
+        safe_category = category.replace(" ", "_").lower()
+        category_dir = os.path.join(UPLOAD_ROOT, safe_category)
+        if not os.path.exists(category_dir):
+            os.makedirs(category_dir)
+
+        # 3. फाइल रिनेम करें: prompt_id.extension
+        file_extension = file.filename.split(".")[-1]
+        file_name = f"{prompt_id}.{file_extension}"
+        file_location = os.path.join(category_dir, file_name)
+
+        # 4. फाइल सेव करें
+        with open(file_location, "wb+") as file_object:
+            shutil.copyfileobj(file.file, file_object)
+
+        # 5. डेटाबेस में Final URL अपडेट करें
+        host_url = "https://prompt-karo-backend.onrender.com" 
+        final_url = f"{host_url}/uploads/{safe_category}/{file_name}"
+        
+        new_prompt.image_url = final_url
+        db.commit()
+
+        return {"status": "success", "url": final_url}
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- PROMPTS ---
 @app.get("/prompts/", response_model=List[schemas.Prompt])
 def read_prompts(search: str = None, category: str = None, sort_by: str = None, db: Session = Depends(get_db)):
     return crud.get_prompts(db, search=search, category=category, sort_by=sort_by)
-
-@app.post("/prompts/", response_model=schemas.Prompt)
-def create_prompt(prompt: schemas.PromptCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
-    return crud.create_prompt(db=db, prompt=prompt)
 
 @app.delete("/prompts/{prompt_id}")
 def delete_prompt(prompt_id: int, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
@@ -50,16 +107,14 @@ def delete_prompt(prompt_id: int, db: Session = Depends(get_db), authenticated: 
     db.commit()
     return {"message": "Deleted"}
 
-# --- ANALYTICS (Increment View/Copy/Share) ---
+# --- ANALYTICS ---
 @app.post("/prompts/{prompt_id}/increment/{action}")
 def increment_stat(prompt_id: int, action: str, db: Session = Depends(get_db)):
     db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
     if not db_prompt: raise HTTPException(status_code=404)
-    
     if action == "view": db_prompt.views += 1
     elif action == "copy": db_prompt.copies += 1
     elif action == "share": db_prompt.shares += 1
-    
     db.commit()
     return {"status": "success"}
 
@@ -96,9 +151,10 @@ def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends
     }
 
 # --- SETTINGS ---
-@app.get("/settings/")
+@app.get("/settings")
 def get_settings(db: Session = Depends(get_db)):
     settings = db.query(models.AppSetting).all()
+    if not settings: return {"timer_enabled": "false", "timer_seconds": "5"}
     return {s.config_key: s.config_value for s in settings}
 
 @app.post("/settings/")
@@ -110,82 +166,3 @@ def update_setting(key: str, value: str, db: Session = Depends(get_db), authenti
         db.add(setting)
     db.commit()
     return {"status": "success"}
-#-----------Edit prompt-----------
-
-@app.put("/prompts/{prompt_id}") # PUT मेथड डेटा अपडेट करने के लिए होता है
-def update_prompt(prompt_id: int, prompt: schemas.PromptCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
-    db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
-    if not db_prompt:
-        raise HTTPException(status_code=404, detail="Prompt not found")
-    
-    # डेटा अपडेट करें
-    db_prompt.title = prompt.title
-    db_prompt.prompt_text = prompt.prompt_text
-    db_prompt.image_url = prompt.image_url
-    db_prompt.category = prompt.category
-    
-    db.commit()
-    db.refresh(db_prompt)
-    return db_prompt
-#----------Source----------
-@app.get("/sources/")
-def get_sources(db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
-    return crud.get_sources(db)
-
-#'uploads' फोल्डर को पब्लिक करें
-UPLOAD_ROOT = "uploads"
-if not os.path.exists(UPLOAD_ROOT):
-    os.makedirs(UPLOAD_ROOT)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
-
-@app.post("/publish-prompt/")
-async def publish_prompt(
-    title: str = Form(...),
-    prompt_text: str = Form(...),
-    category: str = Form(...),
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_admin)
-):
-    try:
-        # 1. पहले डेटाबेस में प्रॉम्ट सेव करें (ताकि ID मिल जाए)
-        new_prompt = models.Prompt(
-            title=title,
-            prompt_text=prompt_text,
-            category=category,
-            image_url="" # अभी खाली छोड़ें
-        )
-        db.add(new_prompt)
-        db.commit()
-        db.refresh(new_prompt)
-        
-        prompt_id = new_prompt.id
-
-        # 2. कैटेगरी के नाम का फोल्डर बनाएं (Sanitize category name)
-        safe_category = category.replace(" ", "_").lower()
-        category_dir = os.path.join(UPLOAD_ROOT, safe_category)
-        if not os.path.exists(category_dir):
-            os.makedirs(category_dir)
-
-        # 3. फाइल को रिनेम करें: prompt_id.extension
-        file_extension = file.filename.split(".")[-1]
-        file_name = f"{prompt_id}.{file_extension}"
-        file_location = os.path.join(category_dir, file_name)
-
-        # 4. फाइल को सेव करें
-        with open(file_location, "wb+") as file_object:
-            shutil.copyfileobj(file.file, file_object)
-
-        # 5. डेटाबेस में असली URL अपडेट करें
-        # 'https://api.antimprompt.com' को अपने असली डोमेन से बदलें
-        host_url = "https://prompt-karo-backend.onrender.com" 
-        final_url = f"{host_url}/uploads/{safe_category}/{file_name}"
-        
-        new_prompt.image_url = final_url
-        db.commit()
-
-        return {"status": "success", "url": final_url}
-
-    except Exception as e:
-        db.rollback() # अगर कुछ गड़बड़ हो तो DB बदलाव वापस लें
-        raise HTTPException(status_code=500, detail=str(e))

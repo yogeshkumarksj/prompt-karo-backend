@@ -2,6 +2,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc, asc
 import models, schemas
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # यह सभी ओरिजिन को अनुमति देता है
+    allow_credentials=True,
+    allow_methods=["*"],  # GET, POST, OPTIONS सब अनुमति देता है
+    allow_headers=["*"],  # सभी हेडर्स को अनुमति देता है
+)
+
 # --- CATEGORIES LOGIC ---
 
 def get_categories(db: Session):

@@ -1,4 +1,4 @@
-import shutil
+import requests
 import os
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,36 +52,42 @@ async def publish_prompt(
     authenticated: bool = Depends(verify_admin)
 ):
     try:
+        # 1. पहले DB में एंट्री करें ताकि ID मिल जाए
         new_prompt = models.Prompt(
-            title=title,
-            prompt_text=prompt_text,
-            category=category,
-            tags=tags,
-            image_url="" 
+            title=title, prompt_text=prompt_text,
+            category=category, tags=tags, image_url=""
         )
         db.add(new_prompt)
         db.commit()
         db.refresh(new_prompt)
-        
-        prompt_id = new_prompt.id
-        safe_category = category.replace(" ", "_").lower()
-        category_dir = os.path.join(UPLOAD_ROOT, safe_category)
-        if not os.path.exists(category_dir):
-            os.makedirs(category_dir)
 
+        # 2. फाइल का नाम और कैटेगरी तैयार करें
         file_extension = file.filename.split(".")[-1]
-        file_name = f"{prompt_id}.{file_extension}"
-        file_location = os.path.join(category_dir, file_name)
+        new_filename = f"{new_prompt.id}.{file_extension}"
+        safe_category = category.replace(" ", "_").lower()
 
-        with open(file_location, "wb+") as file_object:
-            shutil.copyfileobj(file.file, file_object)
-
-        host_url = "https://prompt-karo-backend.onrender.com" 
-        final_url = f"{host_url}/uploads/{safe_category}/{file_name}"
+        # 3. फाइल को Hostinger पर भेजें (API Bridge)
+        file_content = await file.read()
         
-        new_prompt.image_url = final_url
-        db.commit()
-        return {"status": "success", "url": final_url}
+        response = requests.post(
+            "https://antimprompt.com/upload_handler.php",
+            data={
+                "key": "my_private_storage_key_99", # PHP वाली की से मैच होनी चाहिए
+                "category": safe_category,
+                "filename": new_filename
+            },
+            files={"file": (new_filename, file_content)}
+        )
+
+        if response.status_code == 200:
+            # 4. अगर Hostinger पर सेव हो गया, तो DB में असली URL अपडेट करें
+            final_url = f"https://antimprompt.com/uploads/{safe_category}/{new_filename}"
+            new_prompt.image_url = final_url
+            db.commit()
+            return {"status": "success", "url": final_url}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to upload to Hostinger")
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

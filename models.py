@@ -28,3 +28,10 @@ class AppSetting(Base):
     id = Column(Integer, primary_key=True, index=True)
     config_key = Column(String, unique=True, index=True)
     config_value = Column(String)
+class Waitlist(Base):
+    __tablename__ = "waitlist"
+    id = Column(Integer, primary_key=True, index=True)
+    full_name = Column(String)
+    email = Column(String)
+    whatsapp = Column(String)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -52,3 +52,7 @@ class Source(SourceBase):
 
     class Config:
         from_attributes = True
+class WaitlistCreate(BaseModel):
+    full_name: str
+    email: str
+    whatsapp: str

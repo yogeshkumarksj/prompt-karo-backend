@@ -50,7 +50,7 @@ class Source(SourceBase):
     id: int
     is_active: bool
 
-    class Config:
+class Config:
         from_attributes = True
 class WaitlistCreate(BaseModel):
     full_name: str

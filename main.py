@@ -171,3 +171,10 @@ def update_setting(key: str, value: str, db: Session = Depends(get_db), authenti
         db.add(setting)
     db.commit()
     return {"status": "success"}
+#Waitist
+@app.post("/waitlist/")
+def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
+    new_entry = models.Waitlist(**data.dict())
+    db.add(new_entry)
+    db.commit()
+    return {"message": "Success"}

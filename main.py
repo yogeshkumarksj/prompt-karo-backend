@@ -69,7 +69,7 @@ async def publish_prompt(
         file_content = await file.read()
         img = Image.open(io.BytesIO(file_content)).convert("RGB")
         webp_buffer = io.BytesIO()
-        img.save(webp_buffer, format="WEBP", quality=80)
+        img.save(webp_buffer, format="WEBP", quality=95)
         
         # 3. फाइल का नाम (ID.webp)
         new_filename = f"{new_prompt.id}.webp"

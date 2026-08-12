@@ -40,7 +40,7 @@ def verify_admin(x_admin_key: str = Header(None)):
 def read_root():
     return {"message": "Antim Prompt API is Live!"}
 
-# --- PUBLISH PROMPT (With File Upload) ---
+# --- PUBLISH PROMPT (With Auto WebP Conversion & Hostinger Upload) ---
 @app.post("/publish-prompt/")
 async def publish_prompt(
     title: str = Form(...),
@@ -54,42 +54,59 @@ async def publish_prompt(
     try:
         # 1. पहले DB में एंट्री करें ताकि ID मिल जाए
         new_prompt = models.Prompt(
-            title=title, prompt_text=prompt_text,
-            category=category, tags=tags, image_url=""
+            title=title, 
+            prompt_text=prompt_text,
+            category=category, 
+            tags=tags, 
+            image_url=""
         )
         db.add(new_prompt)
         db.commit()
         db.refresh(new_prompt)
 
-        # 2. फाइल का नाम और कैटेगरी तैयार करें
-        file_extension = file.filename.split(".")[-1]
-        new_filename = f"{new_prompt.id}.{file_extension}"
+        # 2. इमेज को WebP में बदलें और कंप्रेस करें
+        file_content = await file.read()
+        image = Image.open(io.BytesIO(file_content))
+        
+        # अगर इमेज RGBA (पारदर्शी) है, तो उसे RGB में बदलें ताकि WebP सही बने
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        
+        # मेमोरी में ही WebP फाइल तैयार करें
+        webp_buffer = io.BytesIO()
+        image.save(webp_buffer, format="WEBP", quality=80) # 80% क्वालिटी बेस्ट है
+        webp_data = webp_buffer.getvalue()
+
+        # 3. फाइल का नाम और कैटेगरी तैयार करें (अब हमेशा .webp होगा)
+        new_filename = f"{new_prompt.id}.webp"
         safe_category = category.replace(" ", "_").lower()
 
-        # 3. फाइल को Hostinger पर भेजें (API Bridge)
-        file_content = await file.read()
-        
+        # 4. फाइल को Hostinger पर भेजें (API Bridge)
         response = requests.post(
             "https://antimprompt.com/upload_handler.php",
             data={
-                "key": "my_private_storage_key_99", # PHP वाली की से मैच होनी चाहिए
+                "key": "my_private_storage_key_99", 
                 "category": safe_category,
                 "filename": new_filename
             },
-            files={"file": (new_filename, file_content)}
+            files={"file": (new_filename, webp_data, "image/webp")}
         )
 
         if response.status_code == 200:
-            # 4. अगर Hostinger पर सेव हो गया, तो DB में असली URL अपडेट करें
+            # 5. DB में फाइनल WebP URL अपडेट करें
             final_url = f"https://antimprompt.com/uploads/{safe_category}/{new_filename}"
             new_prompt.image_url = final_url
             db.commit()
             return {"status": "success", "url": final_url}
         else:
+            # अगर फेल हो तो DB से प्रॉम्ट हटा दें (Cleanup)
+            db.delete(new_prompt)
+            db.commit()
             raise HTTPException(status_code=500, detail="Failed to upload to Hostinger")
 
     except Exception as e:
         db.rollback()
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- PROMPTS ---

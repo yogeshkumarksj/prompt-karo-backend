@@ -1,5 +1,9 @@
-import requests
+import shutil
 import os
+import time
+import io  # <--- यह मिसिंग था
+import requests
+from PIL import Image # <--- यह मिसिंग था
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +15,7 @@ from database import engine, get_db
 
 app = FastAPI(title="Antim Prompt API")
 
-# 1. CORS Settings (इसे सबसे ऊपर रखना ज़रूरी है)
+# 1. CORS Settings
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. 'uploads' फोल्डर सेटअप
+# 2. 'uploads' फोल्डर सेटअप (लोकल बैकअप के लिए)
 UPLOAD_ROOT = "uploads"
 if not os.path.exists(UPLOAD_ROOT):
     os.makedirs(UPLOAD_ROOT)
@@ -40,7 +44,7 @@ def verify_admin(x_admin_key: str = Header(None)):
 def read_root():
     return {"message": "Antim Prompt API is Live!"}
 
-# --- PUBLISH PROMPT (With Auto WebP Conversion & Hostinger Upload) ---
+# --- PUBLISH PROMPT (Fixed with correct Imports & Host URL) ---
 @app.post("/publish-prompt/")
 async def publish_prompt(
     title: str = Form(...),
@@ -69,10 +73,9 @@ async def publish_prompt(
         
         # 3. फाइल का नाम (ID.webp)
         new_filename = f"{new_prompt.id}.webp"
-        safe_category = category.replace(" ", "_").lower()
+        safe_category = category.strip().replace(" ", "_").lower()
 
         # 4. Hostinger PHP Bridge को भेजें
-        # पक्का करें कि यह URL सही है
         php_url = "https://antimprompt.com/upload_handler.php" 
         
         response = requests.post(
@@ -86,16 +89,17 @@ async def publish_prompt(
         )
 
         if response.status_code == 200:
-            # 5. DB में Final URL अपडेट करें
-            final_url = f"https://antimprompt.com/uploads/{safe_category}/{new_filename}"
+            # 5. DB में Final URL अपडेट करें (अब Hostinger का लिंक सेव होगा)
+            host_url = "https://antimprompt.com" 
+            final_url = f"{host_url}/uploads/{safe_category}/{new_filename}"
+            
             new_prompt.image_url = final_url
             db.commit()
             return {"status": "success", "url": final_url}
         else:
-            # अगर Hostinger फेल हुआ तो DB से प्रॉम्ट हटा दें
             db.delete(new_prompt)
             db.commit()
-            return {"status": "error", "message": "Hostinger upload failed"}
+            raise HTTPException(status_code=500, detail="Hostinger PHP Bridge Error")
 
     except Exception as e:
         db.rollback()
@@ -181,7 +185,8 @@ def update_setting(key: str, value: str, db: Session = Depends(get_db), authenti
         db.add(setting)
     db.commit()
     return {"status": "success"}
-#Waitist
+
+# --- WAITLIST ---
 @app.post("/waitlist/")
 def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
     new_entry = models.Waitlist(**data.dict())

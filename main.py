@@ -4,7 +4,7 @@ import time
 import io  # <--- यह मिसिंग था
 import requests
 from PIL import Image # <--- यह मिसिंग था
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -12,9 +12,13 @@ from sqlalchemy import func
 from typing import List
 import models, schemas, crud
 from database import engine, get_db
+import json
+import google.generativeai as genai
 
-INSTA_LOOTER_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9a" 
+INSTA_LOOTER_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
 INSTA_LOOTER_HOST = "instagram-looter2.p.rapidapi.com"
+GEMINI_API_KEY = "AIzaSyC14JPjMtFiyTO4Qb7sRb0B74OTIBtUBXk"
+genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="Antim Prompt API")
 
@@ -197,65 +201,71 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Success"}
 
-
 @app.get("/ai-magic/insta-audit/{username}")
 async def insta_audit(username: str):
-    # 1. RapidAPI से Instagram डेटा मंगाना
+    print(f"🚀 Starting Audit for: {username}")
+    
+    # 1. RapidAPI से डेटा लाना
     url = "https://instagram-looter2.p.rapidapi.com/user/info"
-    querystring = {"username": username}
     headers = {
         "x-rapidapi-key": INSTA_LOOTER_KEY,
         "x-rapidapi-host": INSTA_LOOTER_HOST
     }
-
+    
     try:
-        response = requests.get(url, headers=headers, params=querystring)
+        response = requests.get(url, headers=headers, params={"username": username})
         data = response.json()
 
-        # चेक करें कि क्या API ने डेटा दिया
         if not data.get("success") or "data" not in data:
-            raise HTTPException(status_code=404, detail="Instagram user not found")
+            raise HTTPException(status_code=404, detail="User not found")
 
         user_info = data["data"]
 
-        # --- CUSTOM PRIVACY CHECK (सबसे ज़रूरी) ---
-        # अगर अकाउंट प्राइवेट है, तो यहीं से वापस लौट जाओ
-        if user_info.get('is_private') == True:
+        # 2. Privacy Check
+        if user_info.get('is_private'):
             return {
                 "status": "private_account",
-                "message": "This account is private. Please make your account public first to get an AI Audit report."
+                "message": "This account is private. Please make it public first."
             }
-        # ----------------------------------------
 
-        # 2. अगर अकाउंट पब्लिक है, तभी Gemini AI को डेटा भेजें
-        raw_data_for_ai = f"""
-        Profile Name: {user_info.get('full_name')}
-        Bio: {user_info.get('biography')}
-        Followers: {user_info.get('follower_count')}
-        Following: {user_info.get('following_count')}
-        Total Posts: {user_info.get('media_count')}
-        """
-
+        # 3. Gemini AI के लिए डेटा तैयार करना
+        raw_info = f"Name: {user_info.get('full_name')}, Bio: {user_info.get('biography')}, Followers: {user_info.get('follower_count')}, Posts: {user_info.get('media_count')}"
+        
         ai_prompt = f"""
-        You are an Instagram Growth Expert. Analyze this profile data:
-        {raw_data_for_ai}
-        Provide a growth audit report in STRICT JSON format with:
-        "score", "bio_analysis", "bio_suggestion", "content_strategy", "growth_tip".
+        Analyze this Instagram Profile and return ONLY a valid JSON object:
+        Data: {raw_info}
+        
+        JSON Structure:
+        {{
+          "score": 85,
+          "bio_analysis": "string",
+          "bio_suggestion": "string",
+          "content_strategy": "string",
+          "growth_tip": "string"
+        }}
         """
 
+        # मॉडल का नाम 'gemini-1.5-flash' ही रखें
         model = genai.GenerativeModel('gemini-1.5-flash')
         ai_response = model.generate_content(ai_prompt)
         
-        clean_json = ai_response.text.replace('```json', '').replace('```', '').strip()
-        report = json.loads(clean_json)
+        # 4. JSON को सुरक्षित तरीके से साफ़ करना (Clean Markdown)
+        res_text = ai_response.text
+        if "```json" in res_text:
+            res_text = res_text.split("```json")[1].split("```")[0]
+        elif "```" in res_text:
+            res_text = res_text.split("```")[1].split("```")[0]
+        
+        report = json.loads(res_text.strip())
 
         return {
             "status": "success",
-            "username": username,
-            "profile_pic": user_info.get('profile_pic_url'),
             "report": report
         }
 
+    except json.JSONDecodeError:
+        print("🔥 AI returned invalid JSON")
+        raise HTTPException(status_code=500, detail="AI response format error")
     except Exception as e:
-        print(f"Audit Error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate AI Audit")
+        print(f"🔥 Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal Error: {str(e)}")

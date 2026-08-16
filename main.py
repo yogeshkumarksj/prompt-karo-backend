@@ -204,6 +204,9 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 @app.get("/ai-magic/insta-audit/{username}")
 async def insta_audit(username: str):
 
+    # TEMPORARY TEST KEY
+    RAPIDAPI_KEY = "YOUR_RAPIDAPI_KEY_HERE"
+
     url = "https://instagram-looter2.p.rapidapi.com/info"
 
     querystring = {
@@ -211,12 +214,11 @@ async def insta_audit(username: str):
     }
 
     headers = {
-        "x-rapidapi-key": os.getenv("RAPIDAPI_KEY"),
+        "x-rapidapi-key": RAPIDAPI_KEY,
         "x-rapidapi-host": "instagram-looter2.p.rapidapi.com"
     }
 
     try:
-        # RapidAPI call
         response = requests.get(
             url,
             headers=headers,
@@ -224,209 +226,26 @@ async def insta_audit(username: str):
             timeout=30
         )
 
-        print("RAPIDAPI HTTP STATUS:", response.status_code)
-        print("RAPIDAPI RAW RESPONSE:", response.text)
+        print("========== RAPIDAPI DEBUG ==========")
+        print("HTTP STATUS:", response.status_code)
+        print("RESPONSE:", response.text)
+        print("====================================")
 
-        # HTTP error
-        if response.status_code != 200:
-            return {
-                "status": "error",
-                "message": "Instagram API request failed.",
-                "http_status": response.status_code
-            }
+        data = response.json()
 
-        # JSON parse
-        try:
-            data = response.json()
-        except Exception:
-            return {
-                "status": "error",
-                "message": "Instagram API returned invalid JSON.",
-                "raw_response": response.text[:500]
-            }
-
-        # Debug
-        print(
-            "RAPIDAPI JSON:",
-            json.dumps(data, indent=2, ensure_ascii=False)
-        )
-
-        # -----------------------------------
-        # Find user object
-        # -----------------------------------
-
-        user = None
-
-        # Format 1
-        if isinstance(data.get("user"), dict):
-            user = data["user"]
-
-        # Format 2
-        elif isinstance(data.get("data"), dict):
-
-            if isinstance(data["data"].get("user"), dict):
-                user = data["data"]["user"]
-
-            elif isinstance(data["data"], dict):
-                user = data["data"]
-
-        # -----------------------------------
-        # User not found
-        # -----------------------------------
-
-        if not user:
-            return {
-                "status": "error",
-                "message": "Instagram user data was not found.",
-                "username": username,
-                "api_response": data
-            }
-
-        print(
-            "USER FOUND:",
-            user.get("username")
-        )
-
-        # -----------------------------------
-        # Privacy check
-        # -----------------------------------
-
-        if user.get("is_private") is True:
-            return {
-                "status": "private_account",
-                "message": (
-                    "This account is private. "
-                    "Please make it public first to get an AI Audit report."
-                )
-            }
-
-        # -----------------------------------
-        # Extract profile information
-        # -----------------------------------
-
-        full_name = user.get("full_name") or user.get("name")
-        biography = user.get("biography") or user.get("bio")
-
-        follower_count = (
-            user.get("follower_count")
-            or user.get("followers")
-            or user.get("followers_count")
-        )
-
-        media_count = (
-            user.get("media_count")
-            or user.get("posts")
-            or user.get("post_count")
-        )
-
-        profile_pic = (
-            user.get("profile_pic_url")
-            or user.get("profile_pic")
-            or user.get("profile_picture_url")
-        )
-
-        # -----------------------------------
-        # Gemini AI
-        # -----------------------------------
-
-        print("🤖 AI is analyzing the profile...")
-
-        raw_info = f"""
-        Username: {username}
-        Name: {full_name}
-        Bio: {biography}
-        Followers: {follower_count}
-        Posts: {media_count}
-        """
-
-        ai_prompt = f"""
-        Act as an Instagram Growth Expert.
-
-        Analyze this Instagram profile:
-
-        {raw_info}
-
-        Return ONLY valid JSON.
-
-        JSON Structure:
-
-        {{
-          "score": 85,
-          "bio_analysis": "string",
-          "bio_suggestion": "string",
-          "content_strategy": "string",
-          "growth_tip": "string"
-        }}
-        """
-
-        model = genai.GenerativeModel("gemini-1.5-flash")
-
-        ai_response = model.generate_content(ai_prompt)
-
-        res_text = ai_response.text.strip()
-
-        # Remove markdown JSON wrapper
-        if "```json" in res_text:
-            res_text = (
-                res_text
-                .split("```json", 1)[1]
-                .split("```", 1)[0]
-                .strip()
-            )
-
-        elif "```" in res_text:
-            res_text = (
-                res_text
-                .split("```", 1)[1]
-                .split("```", 1)[0]
-                .strip()
-            )
-
-        report = json.loads(res_text)
-
-        # -----------------------------------
-        # Final response
-        # -----------------------------------
-
+        # TEMPORARY: directly return API response
+        # Gemini aur parsing ko abhi test nahi kar rahe
         return {
-            "status": "success",
+            "status": "testing",
+            "http_status": response.status_code,
             "username": username,
-            "profile_pic": profile_pic,
-            "profile": {
-                "full_name": full_name,
-                "biography": biography,
-                "followers": follower_count,
-                "posts": media_count,
-                "is_private": user.get("is_private"),
-                "is_verified": user.get("is_verified")
-                    or user.get("is_verified_user")
-            },
-            "report": report
+            "rapidapi_response": data
         }
 
-    except requests.exceptions.RequestException as e:
-
-        print(f"🔥 RAPIDAPI REQUEST ERROR: {str(e)}")
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Instagram API request failed: {str(e)}"
-        )
-
-    except json.JSONDecodeError as e:
-
-        print(f"🔥 JSON ERROR: {str(e)}")
-
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to parse AI response as JSON."
-        )
-
     except Exception as e:
+        print("RAPIDAPI ERROR:", str(e))
 
-        print(f"🔥 ERROR: {str(e)}")
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal Server Error: {str(e)}"
-        )
+        return {
+            "status": "error",
+            "message": str(e)
+        }

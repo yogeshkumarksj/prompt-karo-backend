@@ -203,69 +203,58 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 
 @app.get("/ai-magic/insta-audit/{username}")
 async def insta_audit(username: str):
-    print(f"🚀 Starting Audit for: {username}")
+    print(f"🔍 Searching for Instagram User: {username}")
     
-    # 1. RapidAPI से डेटा लाना
-    url = "https://instagram-looter2.p.rapidapi.com/user/info"
+    # 1. RapidAPI Config (Corrected URL for Looter2)
+    url = "https://instagram-looter2.p.rapidapi.com/info" # /user/info से बदलकर /info किया
+    querystring = {"username": username}
     headers = {
         "x-rapidapi-key": INSTA_LOOTER_KEY,
-        "x-rapidapi-host": INSTA_LOOTER_HOST
+        "x-rapidapi-host": "instagram-looter2.p.rapidapi.com"
     }
-    
-    try:
-        response = requests.get(url, headers=headers, params={"username": username})
-        data = response.json()
 
-        if not data.get("success") or "data" not in data:
-            raise HTTPException(status_code=404, detail="User not found")
+    try:
+        # 2. API Call
+        response = requests.get(url, headers=headers, params=querystring)
+        data = response.json()
+        
+        # Render Logs में पूरा डेटा देखने के लिए (Debug)
+        print(f"📡 API Response Data: {data}") 
+
+        # 3. Check if user exists in API response
+        # Instagram Looter 2 में डेटा 'data' की के अंदर होता है
+        if not data or "data" not in data:
+            return {
+                "status": "error",
+                "message": f"User '{username}' not found. Please check the spelling."
+            }
 
         user_info = data["data"]
 
-        # 2. Privacy Check
-        if user_info.get('is_private'):
+        # 4. Privacy Check
+        if user_info.get('is_private') == True:
             return {
                 "status": "private_account",
-                "message": "This account is private. Please make it public first."
+                "message": "This account is private. Make it public to get an AI Audit."
             }
 
-        # 3. Gemini AI के लिए डेटा तैयार करना
+        # 5. Gemini AI Analysis
+        print("🤖 AI is analyzing...")
         raw_info = f"Name: {user_info.get('full_name')}, Bio: {user_info.get('biography')}, Followers: {user_info.get('follower_count')}, Posts: {user_info.get('media_count')}"
         
-        ai_prompt = f"""
-        Analyze this Instagram Profile and return ONLY a valid JSON object:
-        Data: {raw_info}
-        
-        JSON Structure:
-        {{
-          "score": 85,
-          "bio_analysis": "string",
-          "bio_suggestion": "string",
-          "content_strategy": "string",
-          "growth_tip": "string"
-        }}
-        """
+        ai_prompt = f"Act as an Instagram Expert. Analyze this profile and return ONLY JSON: {raw_info}. Keys: score, bio_analysis, bio_suggestion, content_strategy, growth_tip."
 
-        # मॉडल का नाम 'gemini-1.5-flash' ही रखें
         model = genai.GenerativeModel('gemini-1.5-flash')
         ai_response = model.generate_content(ai_prompt)
         
-        # 4. JSON को सुरक्षित तरीके से साफ़ करना (Clean Markdown)
+        # JSON Cleaning
         res_text = ai_response.text
         if "```json" in res_text:
             res_text = res_text.split("```json")[1].split("```")[0]
-        elif "```" in res_text:
-            res_text = res_text.split("```")[1].split("```")[0]
         
         report = json.loads(res_text.strip())
+        return {"status": "success", "report": report}
 
-        return {
-            "status": "success",
-            "report": report
-        }
-
-    except json.JSONDecodeError:
-        print("🔥 AI returned invalid JSON")
-        raise HTTPException(status_code=500, detail="AI response format error")
     except Exception as e:
-        print(f"🔥 Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal Error: {str(e)}")
+        print(f"🔥 Error Detail: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Something went wrong: {str(e)}")

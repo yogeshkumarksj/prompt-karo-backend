@@ -207,10 +207,10 @@ async def insta_audit(username: str):
     # TEMPORARY TEST ONLY
     RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
 
-    url = "https://instagram-looter2.p.rapidapi.com/info"
+    url = "https://instagram-looter2.p.rapidapi.com/search"
 
     querystring = {
-        "username": username
+        "query": username
     }
 
     headers = {

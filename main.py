@@ -207,10 +207,10 @@ async def insta_audit(username: str):
     # TEMPORARY TEST ONLY
     RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
 
-    url = "https://instagram-looter2.p.rapidapi.com/search"
+    url = "https://instagram-looter2.p.rapidapi.com/profile"
 
     querystring = {
-        "query": username
+        "username": username
     }
 
     headers = {
@@ -226,10 +226,10 @@ async def insta_audit(username: str):
             timeout=30
         )
 
-        print("========== RAPIDAPI DEBUG ==========")
+        print("========== RAPIDAPI PROFILE DEBUG ==========")
         print("HTTP STATUS:", response.status_code)
         print("RESPONSE:", response.text)
-        print("====================================")
+        print("============================================")
 
         return {
             "status": "testing",

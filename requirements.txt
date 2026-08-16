@@ -4,6 +4,8 @@ sqlalchemy
 psycopg2-binary
 pydantic
 python-dotenv
-python-multipart
+pytz
 requests
 Pillow
+python-multipart
+google-generativeai

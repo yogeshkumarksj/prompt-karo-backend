@@ -200,11 +200,7 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
     db.add(new_entry)
     db.commit()
     return {"message": "Success"}
-
-
-load_dotenv()
-
-router = APIRouter()
+    
 
 # =========================================================
 # TEMPORARY API KEYS - LOCAL TESTING ONLY

@@ -204,7 +204,7 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 @app.get("/ai-magic/insta-audit/{username}")
 async def insta_audit(username: str):
 
-    # TEMPORARY TEST KEY
+    # TEMPORARY TEST ONLY
     RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
 
     url = "https://instagram-looter2.p.rapidapi.com/info"
@@ -231,18 +231,15 @@ async def insta_audit(username: str):
         print("RESPONSE:", response.text)
         print("====================================")
 
-        data = response.json()
-
-        # TEMPORARY: directly return API response
-        # Gemini aur parsing ko abhi test nahi kar rahe
         return {
             "status": "testing",
             "http_status": response.status_code,
             "username": username,
-            "rapidapi_response": data
+            "rapidapi_response": response.json()
         }
 
     except Exception as e:
+
         print("RAPIDAPI ERROR:", str(e))
 
         return {

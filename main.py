@@ -201,60 +201,54 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Success"}
 
+# main.py में इसे अपडेट करें
+
 @app.get("/ai-magic/insta-audit/{username}")
 async def insta_audit(username: str):
-    print(f"🔍 Searching for Instagram User: {username}")
-    
-    # 1. RapidAPI Config (Corrected URL for Looter2)
-    url = "https://instagram-looter2.p.rapidapi.com/info" # /user/info से बदलकर /info किया
-    querystring = {"username": username}
+    # 1. RapidAPI Config
+    url = "https://instagram-looter2.p.rapidapi.com/info"
     headers = {
-        "x-rapidapi-key": INSTA_LOOTER_KEY,
+        "x-rapidapi-key": "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad",
         "x-rapidapi-host": "instagram-looter2.p.rapidapi.com"
     }
 
     try:
-        # 2. API Call
-        response = requests.get(url, headers=headers, params=querystring)
+        # 2. Instagram से डेटा लाएं
+        response = requests.get(url, headers=headers, params={"username": username})
         data = response.json()
+
+        if not data.get("success"):
+            return {"status": "error", "message": "User not found"}
+
+        user = data["data"]
+
+        # 3. Privacy Check
+        if user.get('is_private'):
+            return {"status": "private", "message": "Account is private. Make it public first!"}
+
+        # 4. Gemini AI Analysis
+        raw_info = f"Name: {user.get('full_name')}, Bio: {user.get('biography')}, Followers: {user.get('follower_count')}, Posts: {user.get('media_count')}"
         
-        # Render Logs में पूरा डेटा देखने के लिए (Debug)
-        print(f"📡 API Response Data: {data}") 
-
-        # 3. Check if user exists in API response
-        # Instagram Looter 2 में डेटा 'data' की के अंदर होता है
-        if not data or "data" not in data:
-            return {
-                "status": "error",
-                "message": f"User '{username}' not found. Please check the spelling."
-            }
-
-        user_info = data["data"]
-
-        # 4. Privacy Check
-        if user_info.get('is_private') == True:
-            return {
-                "status": "private_account",
-                "message": "This account is private. Make it public to get an AI Audit."
-            }
-
-        # 5. Gemini AI Analysis
-        print("🤖 AI is analyzing...")
-        raw_info = f"Name: {user_info.get('full_name')}, Bio: {user_info.get('biography')}, Followers: {user_info.get('follower_count')}, Posts: {user_info.get('media_count')}"
-        
-        ai_prompt = f"Act as an Instagram Expert. Analyze this profile and return ONLY JSON: {raw_info}. Keys: score, bio_analysis, bio_suggestion, content_strategy, growth_tip."
+        ai_prompt = f"""
+        Act as an Instagram Growth Expert. Analyze this profile and return ONLY JSON:
+        {raw_info}
+        JSON Keys: score (0-100), bio_analysis, bio_suggestion, content_strategy, growth_tip.
+        """
 
         model = genai.GenerativeModel('gemini-1.5-flash')
-        ai_response = model.generate_content(ai_prompt)
+        ai_res = model.generate_content(ai_prompt)
         
-        # JSON Cleaning
-        res_text = ai_response.text
-        if "```json" in res_text:
-            res_text = res_text.split("```json")[1].split("```")[0]
-        
+        # JSON Clean and Parse
+        res_text = ai_res.text
+        if "```json" in res_text: res_text = res_text.split("```json")[1].split("```")[0]
         report = json.loads(res_text.strip())
-        return {"status": "success", "report": report}
+
+        return {
+            "status": "success",
+            "profile_pic": user.get('profile_pic_url'),
+            "full_name": user.get('full_name'),
+            "report": report
+        }
 
     except Exception as e:
-        print(f"🔥 Error Detail: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Something went wrong: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

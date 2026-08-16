@@ -201,48 +201,458 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Success"}
 
-@app.get("/ai-magic/insta-audit/{username}")
-async def insta_audit(username: str):
 
-    # TEMPORARY TEST ONLY
-    RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
+load_dotenv()
 
-    url = "https://instagram-looter2.p.rapidapi.com/profile"
+router = APIRouter()
 
-    querystring = {
-        "username": username
-    }
+# =========================================================
+# TEMPORARY API KEYS - LOCAL TESTING ONLY
+# =========================================================
+
+RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
+
+GEMINI_API_KEY = "AIzaSyC14JPjMtFiyTO4Qb7sRb0B74OTIBtUBXk"
+
+# =========================================================
+
+RAPIDAPI_HOST = "instagram-looter2.p.rapidapi.com"
+RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/profile"
+
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+
+# ---------------------------------------------------------
+# Gemini output schema
+# ---------------------------------------------------------
+
+class AuditScore(BaseModel):
+    score: int = Field(ge=0, le=100)
+    reason: str
+
+
+class AuditReport(BaseModel):
+    overall_score: int = Field(ge=0, le=100)
+
+    profile: AuditScore
+    content: AuditScore
+    engagement: AuditScore
+    consistency: AuditScore
+    growth_potential: AuditScore
+
+    strengths: List[str]
+    weaknesses: List[str]
+    recommendations: List[str]
+
+    content_strategy: List[str]
+    hashtag_strategy: List[str]
+
+    summary: str
+
+
+# ---------------------------------------------------------
+# RapidAPI
+# ---------------------------------------------------------
+
+def get_instagram_profile(username: str) -> dict:
 
     headers = {
+        "x-rapidapi-host": RAPIDAPI_HOST,
         "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": "instagram-looter2.p.rapidapi.com"
+    }
+
+    params = {
+        "username": username
     }
 
     try:
         response = requests.get(
-            url,
+            RAPIDAPI_URL,
             headers=headers,
-            params=querystring,
-            timeout=30
+            params=params,
+            timeout=30,
         )
 
-        print("========== RAPIDAPI PROFILE DEBUG ==========")
-        print("HTTP STATUS:", response.status_code)
-        print("RESPONSE:", response.text)
-        print("============================================")
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"RapidAPI request failed: {str(exc)}",
+        )
 
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"RapidAPI returned HTTP {response.status_code}",
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="RapidAPI returned invalid JSON",
+        )
+
+    return data
+
+
+# ---------------------------------------------------------
+# Extract profile metrics
+# ---------------------------------------------------------
+
+def extract_profile_metrics(data: dict) -> dict:
+
+    return {
+        "username": data.get("username"),
+        "full_name": data.get("full_name"),
+        "biography": data.get("biography"),
+
+        "followers": data.get(
+            "edge_followed_by", {}
+        ).get("count", 0),
+
+        "following": data.get(
+            "edge_follow", {}
+        ).get("count", 0),
+
+        "total_posts": data.get(
+            "edge_owner_to_timeline_media", {}
+        ).get("count", 0),
+
+        "is_private": data.get("is_private", False),
+        "is_verified": data.get("is_verified", False),
+        "is_professional_account": data.get(
+            "is_professional_account", False
+        ),
+        "is_business_account": data.get(
+            "is_business_account", False
+        ),
+
+        "profile_pic_url": (
+            data.get("profile_pic_url_hd")
+            or data.get("profile_pic_url")
+        ),
+    }
+
+
+# ---------------------------------------------------------
+# Extract last 10 posts
+# ---------------------------------------------------------
+
+def extract_recent_posts(data: dict, limit: int = 10) -> list:
+
+    media = data.get(
+        "edge_owner_to_timeline_media",
+        {}
+    )
+
+    edges = media.get("edges", [])
+
+    posts = []
+
+    for edge in edges[:limit]:
+
+        post = edge.get("node", {})
+
+        caption_edges = (
+            post.get("edge_media_to_caption", {})
+            .get("edges", [])
+        )
+
+        caption = ""
+
+        if caption_edges:
+            caption = (
+                caption_edges[0]
+                .get("node", {})
+                .get("text", "")
+            )
+
+        likes = (
+            post.get("edge_liked_by", {})
+            .get("count", 0)
+        )
+
+        comments = (
+            post.get("edge_media_to_comment", {})
+            .get("count", 0)
+        )
+
+        video_views = post.get(
+            "video_view_count",
+            0
+        ) or 0
+
+        posts.append({
+            "id": post.get("id"),
+            "shortcode": post.get("shortcode"),
+            "type": post.get("__typename"),
+
+            "caption": caption,
+
+            "likes": likes,
+            "comments": comments,
+            "video_views": video_views,
+
+            "timestamp": post.get(
+                "taken_at_timestamp"
+            ),
+
+            "is_video": post.get(
+                "is_video",
+                False
+            ),
+        })
+
+    return posts
+
+
+# ---------------------------------------------------------
+# Engagement calculation
+# ---------------------------------------------------------
+
+def calculate_engagement(
+    followers: int,
+    posts: list
+) -> dict:
+
+    if not posts:
         return {
-            "status": "testing",
-            "http_status": response.status_code,
-            "username": username,
-            "rapidapi_response": response.json()
+            "average_likes": 0,
+            "average_comments": 0,
+            "average_video_views": 0,
+            "average_engagement_rate": 0,
+            "total_engagement": 0,
         }
 
-    except Exception as e:
+    total_likes = sum(
+        post["likes"]
+        for post in posts
+    )
 
-        print("RAPIDAPI ERROR:", str(e))
+    total_comments = sum(
+        post["comments"]
+        for post in posts
+    )
 
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+    total_views = sum(
+        post["video_views"]
+        for post in posts
+    )
+
+    post_count = len(posts)
+
+    average_likes = total_likes / post_count
+    average_comments = total_comments / post_count
+    average_views = total_views / post_count
+
+    if followers > 0:
+
+        engagement_rates = []
+
+        for post in posts:
+
+            engagement = (
+                post["likes"]
+                + post["comments"]
+            )
+
+            rate = (
+                engagement / followers
+            ) * 100
+
+            engagement_rates.append(rate)
+
+        average_engagement_rate = (
+            sum(engagement_rates)
+            / len(engagement_rates)
+        )
+
+    else:
+        average_engagement_rate = 0
+
+    return {
+        "average_likes": round(
+            average_likes,
+            2
+        ),
+
+        "average_comments": round(
+            average_comments,
+            2
+        ),
+
+        "average_video_views": round(
+            average_views,
+            2
+        ),
+
+        "average_engagement_rate": round(
+            average_engagement_rate,
+            4
+        ),
+
+        "total_engagement": (
+            total_likes
+            + total_comments
+        ),
+    }
+
+
+# ---------------------------------------------------------
+# Gemini audit
+# ---------------------------------------------------------
+
+def generate_ai_audit(
+    profile: dict,
+    posts: list,
+    engagement: dict,
+) -> AuditReport:
+
+    audit_data = {
+        "profile": profile,
+        "recent_posts": posts,
+        "engagement": engagement,
+    }
+
+    prompt = f"""
+You are an expert Instagram growth and content strategist.
+
+Analyze the following Instagram account data.
+
+IMPORTANT:
+- Use ONLY the supplied data.
+- Do not invent metrics.
+- Do not claim access to information that is not supplied.
+- Give practical recommendations.
+- Evaluate profile optimization, content quality,
+  engagement, consistency and growth potential.
+
+Instagram data:
+
+{audit_data}
+
+Return a complete Instagram audit.
+
+Focus on:
+
+1. Profile optimization
+2. Content quality
+3. Engagement
+4. Posting consistency
+5. Growth potential
+6. Content strategy
+7. Hashtag strategy
+8. Strengths
+9. Weaknesses
+10. Actionable recommendations
+
+Return ONLY structured JSON matching the requested schema.
+"""
+
+    try:
+
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": AuditReport,
+            },
+        )
+
+        if response.parsed:
+            return response.parsed
+
+        return AuditReport.model_validate_json(
+            response.text
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini audit generation failed: {str(exc)}",
+        )
+
+
+# ---------------------------------------------------------
+# FINAL API
+# ---------------------------------------------------------
+
+@router.get("/ai-magic/insta-audit/{username}")
+def instagram_audit(username: str):
+
+    username = username.strip().lstrip("@")
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram username is required"
+        )
+
+    if not RAPIDAPI_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="RAPIDAPI_KEY is not configured"
+        )
+
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not configured"
+        )
+
+    # 1. RapidAPI
+    raw_profile = get_instagram_profile(
+        username
+    )
+
+    # Check API response
+    if raw_profile.get("status") is False:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Instagram profile not found"
+        )
+
+    # 2. Profile metrics
+    profile = extract_profile_metrics(
+        raw_profile
+    )
+
+    # 3. Last 10 posts
+    recent_posts = extract_recent_posts(
+        raw_profile,
+        limit=10
+    )
+
+    # 4. Engagement
+    engagement = calculate_engagement(
+        followers=profile["followers"],
+        posts=recent_posts
+    )
+
+    # 5. Gemini
+    audit = generate_ai_audit(
+        profile=profile,
+        posts=recent_posts,
+        engagement=engagement,
+    )
+
+    # 6. Final JSON
+    return {
+        "status": "success",
+
+        "username": username,
+
+        "profile": profile,
+
+        "recent_posts": recent_posts,
+
+        "engagement": engagement,
+
+        "ai_audit": audit.model_dump(),
+    }

@@ -13,7 +13,7 @@ from typing import List
 import models, schemas, crud
 from database import engine, get_db
 
-INSTA_LOOTER_KEY = "आपकी_असली_RAPIDAPI_KEY_यहाँ_डालें" 
+INSTA_LOOTER_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9a" 
 INSTA_LOOTER_HOST = "instagram-looter2.p.rapidapi.com"
 
 app = FastAPI(title="Antim Prompt API")

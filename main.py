@@ -205,7 +205,7 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 async def insta_audit(username: str):
 
     # TEMPORARY TEST KEY
-    RAPIDAPI_KEY = "YOUR_RAPIDAPI_KEY_HERE"
+    RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
 
     url = "https://instagram-looter2.p.rapidapi.com/info"
 

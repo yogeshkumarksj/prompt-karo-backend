@@ -193,3 +193,66 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
     db.add(new_entry)
     db.commit()
     return {"message": "Success"}
+
+
+@app.get("/ai-magic/insta-audit/{username}")
+async def insta_audit(username: str):
+    # 1. RapidAPI से Instagram डेटा मंगाना
+    url = "https://instagram-looter2.p.rapidapi.com/user/info"
+    querystring = {"username": username}
+    headers = {
+        "x-rapidapi-key": INSTA_LOOTER_KEY,
+        "x-rapidapi-host": INSTA_LOOTER_HOST
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=querystring)
+        data = response.json()
+
+        # चेक करें कि क्या API ने डेटा दिया
+        if not data.get("success") or "data" not in data:
+            raise HTTPException(status_code=404, detail="Instagram user not found")
+
+        user_info = data["data"]
+
+        # --- CUSTOM PRIVACY CHECK (सबसे ज़रूरी) ---
+        # अगर अकाउंट प्राइवेट है, तो यहीं से वापस लौट जाओ
+        if user_info.get('is_private') == True:
+            return {
+                "status": "private_account",
+                "message": "This account is private. Please make your account public first to get an AI Audit report."
+            }
+        # ----------------------------------------
+
+        # 2. अगर अकाउंट पब्लिक है, तभी Gemini AI को डेटा भेजें
+        raw_data_for_ai = f"""
+        Profile Name: {user_info.get('full_name')}
+        Bio: {user_info.get('biography')}
+        Followers: {user_info.get('follower_count')}
+        Following: {user_info.get('following_count')}
+        Total Posts: {user_info.get('media_count')}
+        """
+
+        ai_prompt = f"""
+        You are an Instagram Growth Expert. Analyze this profile data:
+        {raw_data_for_ai}
+        Provide a growth audit report in STRICT JSON format with:
+        "score", "bio_analysis", "bio_suggestion", "content_strategy", "growth_tip".
+        """
+
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        ai_response = model.generate_content(ai_prompt)
+        
+        clean_json = ai_response.text.replace('```json', '').replace('```', '').strip()
+        report = json.loads(clean_json)
+
+        return {
+            "status": "success",
+            "username": username,
+            "profile_pic": user_info.get('profile_pic_url'),
+            "report": report
+        }
+
+    except Exception as e:
+        print(f"Audit Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate AI Audit")

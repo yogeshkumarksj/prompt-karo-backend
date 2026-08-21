@@ -24,6 +24,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 app = FastAPI(title="Antim Prompt API")
 
+# Shared async HTTP client for RapidAPI, Instagram CDN and Hostinger.
+# Keeping one client avoids creating a new TCP connection for every request.
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+    follow_redirects=True,
+)
+
 # 1. CORS Settings
 # IMPORTANT:
 # Do not use allow_origins=["*"] together with allow_credentials=True.

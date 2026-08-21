@@ -1,11 +1,11 @@
 import shutil
 import asyncio
 import os
+import re
 import time
 import io  # <--- यह मिसिंग था
 import requests
 import httpx
-import asyncio
 from PIL import Image # <--- यह मिसिंग था
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -220,7 +220,7 @@ RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/profile"
 # -------------------------
 # Do not let a burst of requests overload RapidAPI/Gemini.
 # Requests above this limit wait asynchronously instead of blocking the event loop.
-AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "10"))
+AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "50"))
 AUDIT_CACHE_TTL = int(os.getenv("AUDIT_CACHE_TTL", "60"))
 AUDIT_SEMAPHORE = asyncio.Semaphore(AUDIT_MAX_CONCURRENT)
 AUDIT_CACHE_MAX = int(os.getenv("AUDIT_CACHE_MAX", "500"))
@@ -465,6 +465,219 @@ async def get_instagram_profile_async(username: str) -> dict:
         )
 
 
+
+# ---------------------------------------------------------
+# Profile image -> Hostinger permanent storage
+# ---------------------------------------------------------
+async def save_profile_pic_to_hostinger(img_url: str, username: str):
+    """
+    Download Instagram CDN profile image and upload it to Hostinger.
+
+    Important:
+    - Uses the shared httpx AsyncClient; no blocking requests.post().
+    - Sends Instagram-like headers because CDN URLs may reject plain clients.
+    - Uses the actual content-type returned by Instagram.
+    - Validates the Hostinger bridge response before returning the permanent URL.
+    """
+    if not img_url:
+        print(f"⚠️ No profile image URL for @{username}")
+        return None
+
+    username = re.sub(r"[^a-zA-Z0-9_.-]", "_", username)
+    file_name = f"{username}_profile.jpg"
+
+    try:
+        print(f"📸 Downloading Instagram profile image: @{username}")
+
+        instagram_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/151.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.instagram.com/",
+        }
+
+        # Some Instagram CDN URLs can be sensitive to redirects.
+        img_res = await http_client.get(
+            img_url,
+            headers=instagram_headers,
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            follow_redirects=True,
+        )
+
+        print(
+            f"📥 Instagram image response: "
+            f"{img_res.status_code}, "
+            f"type={img_res.headers.get('content-type')}, "
+            f"bytes={len(img_res.content)}"
+        )
+
+        if img_res.status_code != 200:
+            print(
+                f"❌ Instagram image download failed: "
+                f"HTTP {img_res.status_code}"
+            )
+            return None
+
+        img_data = img_res.content
+
+        if not img_data:
+            print("❌ Instagram returned empty image data")
+            return None
+
+        content_type = (
+            img_res.headers.get("content-type", "")
+            .split(";")[0]
+            .strip()
+            .lower()
+        )
+
+        # We save using .jpg, but if the source is another image format,
+        # Hostinger still receives the actual MIME type.
+        upload_content_type = (
+            content_type
+            if content_type.startswith("image/")
+            else "image/jpeg"
+        )
+
+        php_url = "https://antimprompt.com/upload_handler.php"
+
+        upload_data = {
+            "key": "my_private_storage_key_99",
+            "category": "profiles",
+            "filename": file_name,
+        }
+
+        upload_files = {
+            "file": (
+                file_name,
+                img_data,
+                upload_content_type,
+            )
+        }
+
+        print(
+            f"📤 Uploading {file_name} to Hostinger "
+            f"({len(img_data)} bytes)"
+        )
+
+        # IMPORTANT: httpx multipart upload is async.
+        upload_response = await http_client.post(
+            php_url,
+            data=upload_data,
+            files=upload_files,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+        )
+
+        response_text = upload_response.text[:2000]
+
+        print(
+            f"📡 Hostinger upload response: "
+            f"HTTP {upload_response.status_code} | {response_text}"
+        )
+
+        if upload_response.status_code != 200:
+            print("❌ Hostinger PHP bridge returned non-200")
+            return None
+
+        # The bridge may return JSON or plain text.
+        bridge_ok = False
+        try:
+            bridge_json = upload_response.json()
+
+            if isinstance(bridge_json, dict):
+                bridge_status = str(
+                    bridge_json.get("status", "")
+                ).lower()
+
+                bridge_ok = (
+                    bridge_status in {
+                        "success",
+                        "ok",
+                        "uploaded",
+                        "true",
+                    }
+                    or bridge_json.get("success") is True
+                    or bridge_json.get("url")
+                )
+            else:
+                bridge_ok = bool(bridge_json)
+
+        except ValueError:
+            # Plain-text PHP response.
+            lowered = response_text.lower()
+            bridge_ok = any(
+                word in lowered
+                for word in (
+                    "success",
+                    "uploaded",
+                    "upload successful",
+                    "file uploaded",
+                )
+            )
+
+        if not bridge_ok:
+            print(
+                "❌ Hostinger responded 200, but upload was not "
+                "confirmed as successful."
+            )
+            return None
+
+        permanent_url = (
+            "https://antimprompt.com/uploads/"
+            f"profiles/{file_name}"
+        )
+
+        # Verify that the generated URL is actually reachable.
+        try:
+            verify_response = await http_client.head(
+                permanent_url,
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                follow_redirects=True,
+            )
+
+            if verify_response.status_code >= 400:
+                # Some hosts don't support HEAD correctly. Do a tiny GET.
+                verify_response = await http_client.get(
+                    permanent_url,
+                    headers={"Range": "bytes=0-20"},
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    follow_redirects=True,
+                )
+
+            if verify_response.status_code >= 400:
+                print(
+                    f"⚠️ Hostinger upload reported success but URL "
+                    f"verification failed: HTTP {verify_response.status_code}"
+                )
+                # Do NOT replace the Instagram URL unless we know the
+                # permanent file is reachable.
+                return None
+
+        except httpx.RequestError as exc:
+            print(
+                f"⚠️ Could not verify Hostinger URL: {str(exc)}"
+            )
+            # Upload may still have succeeded; return the permanent URL
+            # because the bridge itself confirmed success.
+
+        print(f"✅ Permanent profile image: {permanent_url}")
+        return permanent_url
+
+    except httpx.TimeoutException:
+        print(f"⏱️ Profile image transfer timed out: @{username}")
+    except httpx.RequestError as exc:
+        print(f"🔥 Profile image HTTP error: {str(exc)}")
+    except Exception as exc:
+        print(f"🔥 Profile image transfer error: {str(exc)}")
+
+    return None
+
+
 # ---------------------------------------------------------
 # Source-provided follower gender demographics
 # ---------------------------------------------------------
@@ -685,19 +898,56 @@ Evaluate:
 # One complete audit job
 # ---------------------------------------------------------
 
-def run_audit_job(username: str) -> dict:
-    """Synchronous worker. All data is local to this username/request."""
-    raw_profile = get_instagram_profile(username)
+async def run_audit_job(username: str) -> dict:
+    """Complete non-blocking audit job for one username."""
+    raw_profile = await get_instagram_profile_async(username)
 
     if raw_profile.get("status") is False:
-        raise HTTPException(status_code=404, detail="Instagram profile not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Instagram profile not found",
+        )
 
     profile = extract_profile_metrics(raw_profile)
-    recent_posts = extract_recent_posts(raw_profile, limit=10)
-    engagement = calculate_engagement(profile["followers"], recent_posts)
-    gender = extract_follower_gender(raw_profile, profile["followers"])
 
-    audit = generate_ai_audit(
+    if profile.get("is_private"):
+        return {
+            "status": "private",
+            "username": username,
+            "profile": profile,
+            "message": "Account is private. Make it public first!",
+        }
+
+    # Persist profile image on Hostinger.
+    original_url = profile.get("profile_pic_url")
+    permanent_url = await save_profile_pic_to_hostinger(
+        original_url,
+        username,
+    )
+
+    if permanent_url:
+        profile["profile_pic_url"] = permanent_url
+    else:
+        print(
+            f"⚠️ Using original Instagram URL for @{username}"
+        )
+
+    recent_posts = extract_recent_posts(
+        raw_profile,
+        limit=10,
+    )
+    engagement = calculate_engagement(
+        profile["followers"],
+        recent_posts,
+    )
+    gender = extract_follower_gender(
+        raw_profile,
+        profile["followers"],
+    )
+
+    # Current Gemini function in this file is synchronous.
+    audit = await asyncio.to_thread(
+        generate_ai_audit,
         profile=profile,
         posts=recent_posts,
         engagement=engagement,
@@ -735,7 +985,7 @@ async def get_cached_or_run_audit(username: str) -> dict:
         else:
             async def worker():
                 async with AUDIT_SEMAPHORE:
-                    return await asyncio.to_thread(run_audit_job, username)
+                    return await run_audit_job(username)
 
             task = asyncio.create_task(worker())
             AUDIT_INFLIGHT[username] = task

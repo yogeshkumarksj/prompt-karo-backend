@@ -4,21 +4,20 @@ import time
 import io  # <--- यह मिसिंग था
 import requests
 from PIL import Image # <--- यह मिसिंग था
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form, Depends
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
+from pydantic import BaseModel, Field
 import models, schemas, crud
 from database import engine, get_db
 import json
 from google import genai
 
-INSTA_LOOTER_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
 INSTA_LOOTER_HOST = "instagram-looter2.p.rapidapi.com"
-GEMINI_API_KEY = "AIzaSyC14JPjMtFiyTO4Qb7sRb0B74OTIBtUBXk"
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 app = FastAPI(title="Antim Prompt API")
 
@@ -196,7 +195,7 @@ def update_setting(key: str, value: str, db: Session = Depends(get_db), authenti
 # --- WAITLIST ---
 @app.post("/waitlist/")
 def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
-    new_entry = models.Waitlist(**data.dict())
+    new_entry = models.Waitlist(**data.model_dump())
     db.add(new_entry)
     db.commit()
     return {"message": "Success"}
@@ -206,9 +205,9 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 # TEMPORARY API KEYS - LOCAL TESTING ONLY
 # =========================================================
 
-RAPIDAPI_KEY = "9aa50aaf7emsh7fa4eb99ecfc6e3p1f66acjsnc012ddab9aad"
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY") or os.getenv("INSTA_LOOTER_KEY")
 
-GEMINI_API_KEY = "AIzaSyC14JPjMtFiyTO4Qb7sRb0B74OTIBtUBXk"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # =========================================================
 
@@ -578,7 +577,7 @@ Return ONLY structured JSON matching the requested schema.
 # FINAL API
 # ---------------------------------------------------------
 
-@router.get("/ai-magic/insta-audit/{username}")
+@app.get("/ai-magic/insta-audit/{username}")
 def instagram_audit(username: str):
 
     username = username.strip().lstrip("@")

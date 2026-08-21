@@ -25,12 +25,23 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 app = FastAPI(title="Antim Prompt API")
 
 # 1. CORS Settings
+# IMPORTANT:
+# Do not use allow_origins=["*"] together with allow_credentials=True.
+# The browser frontend is running on Vite localhost:5173.
+CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://antimprompt.com",
+    "https://www.antimprompt.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # 2. 'uploads' फोल्डर सेटअप (लोकल बैकअप के लिए)
@@ -52,6 +63,14 @@ def verify_admin(x_admin_key: str = Header(None)):
 @app.get("/")
 def read_root():
     return {"message": "Antim Prompt API is Live!"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.options("/ai-magic/insta-audit/{username}")
+async def insta_audit_options(username: str):
+    return {"status": "ok"}
 
 # --- PUBLISH PROMPT (Fixed with correct Imports & Host URL) ---
 @app.post("/publish-prompt/")
@@ -440,11 +459,27 @@ async def get_instagram_profile_async(username: str) -> dict:
 
     try:
         response = await http_client.get(
-            RAPIDAPI_URL,  # confirmed /profile endpoint
+            RAPIDAPI_URL,
             headers=headers,
             params={"username": username},
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
         )
-        response.raise_for_status()
+
+        print(
+            f"📡 RapidAPI /profile: HTTP {response.status_code} "
+            f"username=@{username}"
+        )
+
+        if response.status_code != 200:
+            print(f"❌ RapidAPI response: {response.text[:1000]}")
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"RapidAPI returned HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                ),
+            )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
@@ -632,38 +667,25 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             f"profiles/{file_name}"
         )
 
-        # Verify that the generated URL is actually reachable.
+        # Verify with GET only. Some Hostinger configurations disable HEAD.
         try:
-            verify_response = await http_client.head(
+            verify_response = await http_client.get(
                 permanent_url,
+                headers={"Range": "bytes=0-20"},
                 timeout=httpx.Timeout(10.0, connect=5.0),
                 follow_redirects=True,
             )
-
-            if verify_response.status_code >= 400:
-                # Some hosts don't support HEAD correctly. Do a tiny GET.
-                verify_response = await http_client.get(
-                    permanent_url,
-                    headers={"Range": "bytes=0-20"},
-                    timeout=httpx.Timeout(10.0, connect=5.0),
-                    follow_redirects=True,
-                )
 
             if verify_response.status_code >= 400:
                 print(
                     f"⚠️ Hostinger upload reported success but URL "
                     f"verification failed: HTTP {verify_response.status_code}"
                 )
-                # Do NOT replace the Instagram URL unless we know the
-                # permanent file is reachable.
                 return None
 
         except httpx.RequestError as exc:
-            print(
-                f"⚠️ Could not verify Hostinger URL: {str(exc)}"
-            )
-            # Upload may still have succeeded; return the permanent URL
-            # because the bridge itself confirmed success.
+            print(f"⚠️ Could not verify Hostinger URL: {str(exc)}")
+            return None
 
         print(f"✅ Permanent profile image: {permanent_url}")
         return permanent_url
@@ -1024,16 +1046,38 @@ async def instagram_audit(username: str):
     username = username.strip().lstrip("@").lower()
 
     if not username:
-        raise HTTPException(status_code=400, detail="Instagram username is required")
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram username is required",
+        )
 
     if not RAPIDAPI_KEY:
-        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="RAPIDAPI_KEY is not configured",
+        )
 
     if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not configured",
+        )
 
-    # Non-blocking async wait. Each username gets its own result.
-    return await get_cached_or_run_audit(username)
+    try:
+        print(f"🚀 Audit request received: @{username}")
+        result = await get_cached_or_run_audit(username)
+        print(f"✅ Audit completed: @{username}")
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"🔥 AUDIT ERROR @{username}: {type(exc).__name__}: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Instagram audit failed: {type(exc).__name__}: {str(exc)}",
+        )
 
 
 @app.on_event("shutdown")

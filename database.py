@@ -1,34 +1,57 @@
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Render/Supabase URL प्राप्त करें
+# Render / Supabase DATABASE_URL
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
 
-# अगर URL postgres:// से शुरू हो रहा है, तो उसे postgresql:// में बदलें (SQLAlchemy के लिए ज़रूरी)
-if SQLALCHEMY_DATABASE_URL and SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
-    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# PostgreSQL URL को psycopg2 driver के साथ normalize करें
+if SQLALCHEMY_DATABASE_URL:
+    if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
+        SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+            "postgres://",
+            "postgresql+psycopg2://",
+            1
+        )
 
-# अगर कोई URL नहीं है (लोकल टेस्टिंग के लिए)
+    elif SQLALCHEMY_DATABASE_URL.startswith("postgresql://"):
+        SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+            "postgresql://",
+            "postgresql+psycopg2://",
+            1
+        )
+
+    elif SQLALCHEMY_DATABASE_URL.startswith("postgresql+psycopg://"):
+        SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+            "postgresql+psycopg://",
+            "postgresql+psycopg2://",
+            1
+        )
+
+# Local development fallback
 if not SQLALCHEMY_DATABASE_URL:
     SQLALCHEMY_DATABASE_URL = "sqlite:///./promptverse.db"
 
-# इंजन सेटअप
-if "postgresql" in SQLALCHEMY_DATABASE_URL:
+# Database engine
+if SQLALCHEMY_DATABASE_URL.startswith("postgresql"):
     engine = create_engine(SQLALCHEMY_DATABASE_URL)
 else:
     engine = create_engine(
-        SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+        SQLALCHEMY_DATABASE_URL,
+        connect_args={"check_same_thread": False}
     )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
 
-# --- यह लाइन सबसे ज़रूरी है (यही एरर दे रही थी) ---
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()

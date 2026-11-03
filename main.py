@@ -252,6 +252,24 @@ DEFAULT_GEMINI_MODELS = "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite
 # request still finishes while the frontend is waiting.
 GEMINI_SAME_MODEL_RETRY_SECONDS = 0.4
 
+# Latest Graph API version documented for Business Discovery (sample calls use v26.0).
+# https://developers.facebook.com/docs/graph-api/changelog/
+# https://developers.facebook.com/docs/instagram-platform/instagram-api-with-facebook-login/business-discovery/
+DEFAULT_IG_GRAPH_API_VERSION = "v26.0"
+_IG_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+# Public IG User fields plus documented node fields the audit needs
+# (name, follows_count, profile_picture_url). Media fields match the
+# Business Discovery sample (like_count, comments_count, view_count) and the
+# public IG Media fields caption, media_type, timestamp, permalink, shortcode.
+# https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/
+# https://developers.facebook.com/docs/instagram-platform/reference/instagram-media/
+_IG_DISCOVERY_MEDIA_FIELDS = (
+    "id,caption,like_count,comments_count,media_type,timestamp,permalink,shortcode,view_count"
+)
+_IG_GRAPH_RATE_LIMIT_CODES = {4, 17, 32, 341, 613, 80002}
+_IG_GRAPH_TOKEN_CODES = {102, 190}
+_IG_GRAPH_TOKEN_SUBCODES = {458, 459, 460, 463, 464, 467, 492}
+
 RAPIDAPI_HOST = "instagram-looter2.p.rapidapi.com"
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/profile"
 
@@ -1231,32 +1249,47 @@ async def run_audit_job(username: str) -> dict:
 # Concurrent-safe cache / request de-duplication
 # ---------------------------------------------------------
 
-async def get_cached_or_run_audit(username: str) -> dict:
+async def get_cached_or_run_audit(
+    username: str,
+    runner=None,
+    cache_key: Optional[str] = None,
+) -> dict:
+    """Share one cache, in-flight map, and semaphore across audit sources.
+
+    The RapidAPI route keeps using the bare username as its cache key.
+    Other sources pass their own cache_key so the two payloads never mix,
+    while still sharing AUDIT_SEMAPHORE.
+    """
+    key = cache_key or username
+    if runner is None:
+        async def runner(name: str) -> dict:
+            return await run_audit_job(name)
+
     now = time.monotonic()
 
     async with AUDIT_CACHE_LOCK:
-        cached = AUDIT_CACHE.get(username)
+        cached = AUDIT_CACHE.get(key)
         if cached and now - cached["created_at"] < AUDIT_CACHE_TTL:
             return cached["data"]
 
         # If the same username is already being processed, all callers await
-        # that task rather than starting duplicate RapidAPI + Gemini calls.
-        existing_task = AUDIT_INFLIGHT.get(username)
+        # that task rather than starting duplicate profile + Gemini calls.
+        existing_task = AUDIT_INFLIGHT.get(key)
         if existing_task:
             task = existing_task
         else:
             async def worker():
                 async with AUDIT_SEMAPHORE:
-                    return await run_audit_job(username)
+                    return await runner(username)
 
             task = asyncio.create_task(worker())
-            AUDIT_INFLIGHT[username] = task
+            AUDIT_INFLIGHT[key] = task
 
     try:
         result = await task
 
         async with AUDIT_CACHE_LOCK:
-            AUDIT_CACHE[username] = {
+            AUDIT_CACHE[key] = {
                 "created_at": time.monotonic(),
                 "data": result,
             }
@@ -1273,8 +1306,344 @@ async def get_cached_or_run_audit(username: str) -> dict:
 
     finally:
         async with AUDIT_CACHE_LOCK:
-            if AUDIT_INFLIGHT.get(username) is task:
-                AUDIT_INFLIGHT.pop(username, None)
+            if AUDIT_INFLIGHT.get(key) is task:
+                AUDIT_INFLIGHT.pop(key, None)
+
+
+# ---------------------------------------------------------
+# Instagram Graph API Business Discovery (no RapidAPI)
+# ---------------------------------------------------------
+
+def ig_graph_api_version() -> str:
+    raw = (os.getenv("IG_GRAPH_API_VERSION") or DEFAULT_IG_GRAPH_API_VERSION).strip()
+    if not raw.lower().startswith("v"):
+        raw = f"v{raw}"
+    else:
+        raw = "v" + raw[1:]
+    if not re.fullmatch(r"v\d+\.\d+", raw):
+        raise HTTPException(
+            status_code=500,
+            detail="IG_GRAPH_API_VERSION must look like v26.0",
+        )
+    return raw
+
+
+def ig_graph_credentials() -> Tuple[str, str, str]:
+    token = (os.getenv("IG_GRAPH_ACCESS_TOKEN") or "").strip()
+    account_id = (os.getenv("IG_BUSINESS_ACCOUNT_ID") or "").strip()
+    if not token or not account_id:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Instagram Graph API is not configured. "
+                "Set IG_GRAPH_ACCESS_TOKEN and IG_BUSINESS_ACCOUNT_ID."
+            ),
+        )
+    if not re.fullmatch(r"\d+", account_id):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "IG_BUSINESS_ACCOUNT_ID must be the numeric Instagram "
+                "professional account id from the Facebook Page."
+            ),
+        )
+    return token, account_id, ig_graph_api_version()
+
+
+def business_discovery_fields(username: str, include_extended: bool = True) -> str:
+    """Field expansion for one public Business or Creator account.
+
+    The username is interpolated into the Graph field string, so it has to
+    match Instagram's username alphabet before it is sent.
+
+    Fields marked Public on the IG User reference are always requested.
+    name, follows_count, and profile_picture_url are documented IG User fields
+    the audit uses; if Graph rejects them as non-public, the caller retries
+    without them.
+    """
+    if not _IG_USERNAME_RE.fullmatch(username):
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram username is invalid",
+        )
+    profile_fields = "id,username,biography,website,followers_count,media_count"
+    if include_extended:
+        profile_fields = (
+            "id,username,name,biography,website,followers_count,follows_count,"
+            "media_count,profile_picture_url"
+        )
+    return (
+        f"business_discovery.username({username})"
+        f"{{{profile_fields},media.limit(10){{{_IG_DISCOVERY_MEDIA_FIELDS}}}}}"
+    )
+
+
+def _graph_rejected_extended_field(body: Any) -> bool:
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict) or error.get("code") != 100:
+        return False
+    message = str(error.get("message") or "").lower()
+    return "nonexisting field" in message or "tried accessing" in message
+
+
+def _redact_graph_secret(text: str) -> str:
+    token = (os.getenv("IG_GRAPH_ACCESS_TOKEN") or "").strip()
+    if token:
+        text = text.replace(token, "[redacted]")
+    return re.sub(r"access_token=[^&\s]+", "access_token=[redacted]", text)
+
+
+def _graph_error_exception(status_code: int, body: Any, username: str) -> HTTPException:
+    error = body.get("error") if isinstance(body, dict) else {}
+    if not isinstance(error, dict):
+        error = {}
+    code = error.get("code")
+    subcode = error.get("error_subcode")
+    message = " ".join(
+        str(part)
+        for part in (
+            error.get("message"),
+            error.get("error_user_title"),
+            error.get("error_user_msg"),
+        )
+        if part
+    )
+    lowered = message.lower()
+    safe = _redact_graph_secret(message)[:500]
+
+    if status_code == 429 or code in _IG_GRAPH_RATE_LIMIT_CODES:
+        return HTTPException(
+            status_code=429,
+            detail="Instagram Graph API rate limit reached. Wait and try again.",
+        )
+
+    token_rejected = (
+        code in _IG_GRAPH_TOKEN_CODES
+        or subcode in _IG_GRAPH_TOKEN_SUBCODES
+        or (
+            "access token" in lowered
+            and any(word in lowered for word in ("expired", "invalid", "session", "revoked"))
+        )
+    )
+    if token_rejected:
+        return HTTPException(
+            status_code=401,
+            detail=(
+                "Instagram Graph access token is invalid or expired. "
+                "Generate a new long-lived token and update IG_GRAPH_ACCESS_TOKEN."
+            ),
+        )
+
+    # Business Discovery uses code 110 / subcode 2207013 ("Cannot find User")
+    # when the username does not exist or is not a Business/Creator account.
+    target_missing = (
+        code == 110
+        or subcode == 2207013
+        or "cannot find user" in lowered
+        or "cannot be found" in lowered
+    )
+    if target_missing:
+        return HTTPException(
+            status_code=404,
+            detail=(
+                f"Instagram account @{username} was not found, or Business Discovery "
+                "cannot read it. The account must be a public Business or Creator account. "
+                "Personal accounts are not available."
+            ),
+        )
+
+    if code == 10 or (isinstance(code, int) and 200 <= code <= 299):
+        return HTTPException(
+            status_code=403,
+            detail=(
+                "Instagram Graph token is missing permissions. It needs "
+                "instagram_basic, instagram_manage_insights, and pages_read_engagement."
+            ),
+        )
+
+    return HTTPException(
+        status_code=502,
+        detail=(
+            "Instagram Graph API request failed "
+            f"(HTTP {status_code}, code {code}): {safe or 'unknown error'}"
+        ),
+    )
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _shortcode_from_permalink(permalink: Optional[str]) -> Optional[str]:
+    if not permalink:
+        return None
+    match = re.search(r"/(?:p|reel|tv)/([^/?#]+)", permalink)
+    return match.group(1) if match else None
+
+
+def map_graph_profile(discovery: dict) -> dict:
+    return {
+        "username": discovery.get("username"),
+        "full_name": discovery.get("name"),
+        "biography": discovery.get("biography"),
+        "website": discovery.get("website"),
+        "followers": _as_int(discovery.get("followers_count")),
+        "following": _as_int(discovery.get("follows_count")),
+        "total_posts": _as_int(discovery.get("media_count")),
+        "is_private": False,
+        "is_verified": None,
+        "is_professional_account": True,
+        "is_business_account": None,
+        "profile_pic_url": discovery.get("profile_picture_url"),
+    }
+
+
+def map_graph_posts(discovery: dict, limit: int = 10) -> list:
+    media = discovery.get("media") if isinstance(discovery.get("media"), dict) else {}
+    rows = media.get("data") if isinstance(media.get("data"), list) else []
+    posts = []
+    for item in rows[:limit]:
+        if not isinstance(item, dict):
+            continue
+        media_type = item.get("media_type")
+        permalink = item.get("permalink")
+        # Graph omits like_count when the owner hides like counts.
+        posts.append({
+            "id": item.get("id"),
+            "shortcode": item.get("shortcode") or _shortcode_from_permalink(permalink),
+            "type": media_type,
+            "caption": item.get("caption") or "",
+            "likes": _as_int(item.get("like_count")),
+            "comments": _as_int(item.get("comments_count")),
+            "video_views": _as_int(item.get("view_count")),
+            "timestamp": item.get("timestamp"),
+            "permalink": permalink,
+            "is_video": media_type == "VIDEO",
+        })
+    return posts
+
+
+def unavailable_follower_gender(followers: int) -> dict:
+    return {
+        "available": False,
+        "source": "not_available",
+        "total_followers": followers,
+        "male": None,
+        "female": None,
+        "other": None,
+        "unknown": None,
+        "reason": (
+            "Instagram Graph Business Discovery does not provide follower gender demographics."
+        ),
+    }
+
+
+async def _graph_get(url: str, token: str, fields: str):
+    return await http_client.get(
+        url,
+        params={"fields": fields, "access_token": token},
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        follow_redirects=False,
+    )
+
+
+async def fetch_business_discovery(username: str) -> dict:
+    token, account_id, version = ig_graph_credentials()
+    url = f"https://graph.facebook.com/{version}/{account_id}"
+    # Ask for the extended profile fields first. If this Graph version rejects
+    # one of them, repeat with only the fields marked Public.
+    field_sets = (
+        business_discovery_fields(username, include_extended=True),
+        business_discovery_fields(username, include_extended=False),
+    )
+
+    for index, fields in enumerate(field_sets):
+        try:
+            response = await _graph_get(url, token, fields)
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Instagram Graph API request failed: {_redact_graph_secret(str(exc))}",
+            )
+
+        print(
+            f"📡 Graph business_discovery: HTTP {response.status_code} username=@{username}"
+        )
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+
+        rejected_field = _graph_rejected_extended_field(body)
+        if rejected_field and index == 0:
+            print(
+                f"⚠️ Graph rejected an extended profile field for @{username}; "
+                "retrying with public fields only"
+            )
+            continue
+
+        if response.status_code != 200 or (isinstance(body, dict) and body.get("error")):
+            raise _graph_error_exception(response.status_code, body, username)
+
+        discovery = body.get("business_discovery") if isinstance(body, dict) else None
+        if not isinstance(discovery, dict):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Instagram account @{username} was not found, or Business Discovery "
+                    "cannot read it. The account must be a public Business or Creator account. "
+                    "Personal accounts are not available."
+                ),
+            )
+        return discovery
+
+    raise HTTPException(
+        status_code=502,
+        detail="Instagram Graph API rejected the Business Discovery field list.",
+    )
+
+
+async def run_graph_audit_job(username: str) -> dict:
+    """Audit one username using Graph Business Discovery and the shared Gemini chain."""
+    discovery = await fetch_business_discovery(username)
+    profile = map_graph_profile(discovery)
+
+    original_url = profile.get("profile_pic_url")
+    permanent_url = await save_profile_pic_to_hostinger(original_url, username)
+    if permanent_url:
+        profile["profile_pic_url"] = permanent_url
+    else:
+        print(f"⚠️ Using original profile image URL for @{username}")
+
+    recent_posts = map_graph_posts(discovery, limit=10)
+    engagement = calculate_engagement(profile["followers"], recent_posts)
+    gender = unavailable_follower_gender(profile["followers"])
+
+    audit, audit_model = await asyncio.to_thread(
+        generate_ai_audit,
+        profile=profile,
+        posts=recent_posts,
+        engagement=engagement,
+        gender=gender,
+    )
+
+    return {
+        "status": "success",
+        "username": username,
+        "profile": profile,
+        "recent_posts": recent_posts,
+        "engagement": engagement,
+        "follower_gender": gender,
+        "ai_audit": audit.model_dump(),
+        "ai_audit_model": audit_model,
+        "source": "instagram_graph",
+    }
 
 
 # ---------------------------------------------------------
@@ -1317,6 +1686,54 @@ async def instagram_audit(username: str):
         raise HTTPException(
             status_code=500,
             detail=f"Instagram audit failed: {type(exc).__name__}: {str(exc)}",
+        )
+
+
+@app.options("/ai-magic/insta-audit-v2/{username}")
+async def insta_audit_v2_options(username: str):
+    return {"status": "ok"}
+
+
+@app.get("/ai-magic/insta-audit-v2/{username}")
+async def instagram_audit_v2(username: str):
+    """Public Business/Creator audit via Instagram Graph Business Discovery."""
+    username = username.strip().lstrip("@").lower()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram username is required",
+        )
+
+    # Validate configuration before touching the cache so a missing token
+    # fails the same way on every request.
+    ig_graph_credentials()
+
+    if not (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY):
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not configured",
+        )
+
+    try:
+        print(f"🚀 Graph audit request received: @{username}")
+        result = await get_cached_or_run_audit(
+            username,
+            runner=run_graph_audit_job,
+            cache_key=f"graph:{username}",
+        )
+        print(f"✅ Graph audit completed: @{username}")
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        safe = _redact_graph_secret(f"{type(exc).__name__}: {exc}")
+        print(f"🔥 GRAPH AUDIT ERROR @{username}: {safe}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Instagram Graph audit failed: {safe}",
         )
 
 

@@ -61,10 +61,14 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 models.Base.metadata.create_all(bind=engine)
 
-ADMIN_KEY = "promptverse_admin_secret_786"
+ADMIN_KEY = os.getenv("ADMIN_KEY")
 
 def verify_admin(x_admin_key: str = Header(None)):
-    if x_admin_key != ADMIN_KEY:
+    # Fail closed: a missing or blank server key must reject every request.
+    if not (ADMIN_KEY and ADMIN_KEY.strip()):
+        raise HTTPException(status_code=503, detail="ADMIN_KEY is not configured")
+    # Never accept a missing or empty header, even if it would match a blank key.
+    if not x_admin_key or x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid Admin Key")
     return True
 

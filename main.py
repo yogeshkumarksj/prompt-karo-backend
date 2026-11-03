@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 import models, schemas, crud
 from database import engine, get_db
@@ -242,6 +242,15 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY") or os.getenv("INSTA_LOOTER_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Comma-separated chain (GEMINI_MODELS). Current primary first, then other
+# stable flash models that support structured JSON via response_schema:
+# https://ai.google.dev/gemini-api/docs/models
+# https://ai.google.dev/gemini-api/docs/generate-content/structured-output
+DEFAULT_GEMINI_MODELS = "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite"
+# One short retry on the same model before switching. Kept small so a Render
+# request still finishes while the frontend is waiting.
+GEMINI_SAME_MODEL_RETRY_SECONDS = 0.4
 
 RAPIDAPI_HOST = "instagram-looter2.p.rapidapi.com"
 RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/profile"
@@ -864,7 +873,190 @@ def calculate_engagement(followers: int, posts: list) -> dict:
 # Gemini audit
 # ---------------------------------------------------------
 
-def generate_ai_audit(profile: dict, posts: list, engagement: dict, gender: dict) -> AuditReport:
+_FATAL_HTTP_CODES = {400, 401, 402, 403, 409, 422}
+_TRANSIENT_HTTP_CODES = {404, 408, 429, 500, 502, 503, 504}
+_FATAL_STATUSES = {
+    "INVALID_ARGUMENT",
+    "FAILED_PRECONDITION",
+    "PERMISSION_DENIED",
+    "UNAUTHENTICATED",
+    "OUT_OF_RANGE",
+}
+_TRANSIENT_STATUSES = {
+    "UNAVAILABLE",
+    "RESOURCE_EXHAUSTED",
+    "DEADLINE_EXCEEDED",
+    "INTERNAL",
+    "ABORTED",
+    "NOT_FOUND",
+}
+_HTTP_CODE_IN_TEXT = re.compile(
+    r"\b(400|401|402|403|404|408|409|422|429|500|502|503|504)\b"
+)
+_STATUS_IN_TEXT = re.compile(
+    r"\b(UNAVAILABLE|RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|INTERNAL|"
+    r"UNAUTHENTICATED|PERMISSION_DENIED|INVALID_ARGUMENT|FAILED_PRECONDITION|"
+    r"NOT_FOUND|ABORTED|OUT_OF_RANGE)\b"
+)
+_DEMAND_PHRASES = (
+    "high demand",
+    "overloaded",
+    "resource exhausted",
+    "try again later",
+    "temporarily unavailable",
+)
+
+
+def gemini_model_chain() -> List[str]:
+    """Models to try, in order. GEMINI_MODELS overrides the defaults."""
+    raw = os.getenv("GEMINI_MODELS")
+    if raw is None or not raw.strip():
+        raw = DEFAULT_GEMINI_MODELS
+
+    models: List[str] = []
+    seen = set()
+    for part in raw.split(","):
+        name = part.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        models.append(name)
+
+    if models:
+        return models
+
+    return [part.strip() for part in DEFAULT_GEMINI_MODELS.split(",") if part.strip()]
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen = set()
+    pending = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+
+
+def _exception_http_code(exc: BaseException) -> Optional[int]:
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _exception_status_name(exc: BaseException) -> Optional[str]:
+    value = getattr(exc, "status", None)
+    if isinstance(value, str) and value.replace("_", "").isalpha():
+        return value.upper()
+    return None
+
+
+def _is_timeout_exception(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    if "timeout" in name:
+        return True
+    return isinstance(exc, TimeoutError)
+
+
+def _error_signals(exc: BaseException) -> Tuple[List[int], List[str], bool, bool]:
+    codes: List[int] = []
+    statuses: List[str] = []
+    timed_out = False
+    overloaded = False
+
+    for current in _iter_exception_chain(exc):
+        code = _exception_http_code(current)
+        status = _exception_status_name(current)
+        if code is not None:
+            codes.append(code)
+        if status:
+            statuses.append(status)
+        if _is_timeout_exception(current):
+            timed_out = True
+
+        text = str(current)
+        if code is None:
+            match = _HTTP_CODE_IN_TEXT.search(text)
+            if match:
+                codes.append(int(match.group(1)))
+        if not status:
+            match = _STATUS_IN_TEXT.search(text)
+            if match:
+                statuses.append(match.group(1))
+
+        lowered = text.lower()
+        if any(phrase in lowered for phrase in _DEMAND_PHRASES):
+            overloaded = True
+        if "timed out" in lowered or "timeout" in lowered or "deadline exceeded" in lowered:
+            timed_out = True
+
+    return codes, statuses, timed_out, overloaded
+
+
+def is_transient_gemini_error(exc: BaseException) -> bool:
+    """True when another model or a short retry might still produce the audit."""
+    codes, statuses, timed_out, overloaded = _error_signals(exc)
+    if any(code in _FATAL_HTTP_CODES for code in codes):
+        return False
+    if any(status in _FATAL_STATUSES for status in statuses):
+        return False
+    if any(code in _TRANSIENT_HTTP_CODES for code in codes):
+        return True
+    if any(status in _TRANSIENT_STATUSES for status in statuses):
+        return True
+    return timed_out or overloaded
+
+
+def _retry_same_model(exc: BaseException) -> bool:
+    """Retry overload/timeouts once. A missing model will not recover in place."""
+    if not is_transient_gemini_error(exc):
+        return False
+    codes, statuses, _, _ = _error_signals(exc)
+    if 404 in codes or "NOT_FOUND" in statuses:
+        return False
+    return True
+
+
+def _safe_error_text(exc: BaseException) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    for secret in (os.getenv("GEMINI_API_KEY"), GEMINI_API_KEY):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = " ".join(text.split())
+    if len(text) > 300:
+        text = text[:300] + "..."
+    return text
+
+
+def _fatal_gemini_detail(model: str, exc: BaseException) -> str:
+    codes, statuses, _, _ = _error_signals(exc)
+    code = codes[0] if codes else None
+    if code in (401, 403) or any(status in {"UNAUTHENTICATED", "PERMISSION_DENIED"} for status in statuses):
+        suffix = f" ({code})" if code else ""
+        return (
+            "Gemini audit generation failed: API key was rejected"
+            f"{suffix}. Check GEMINI_API_KEY. Not falling back to another model."
+        )
+    if code in (400, 422) or "INVALID_ARGUMENT" in statuses:
+        suffix = f" ({code})" if code else ""
+        return (
+            "Gemini audit generation failed: the request was rejected as invalid "
+            f"by {model}{suffix}. Not falling back to another model."
+        )
+    return (
+        "Gemini audit generation failed: non-retryable error from "
+        f"{model}: {_safe_error_text(exc)}. Not falling back to another model."
+    )
+
+
+def generate_ai_audit(
+    profile: dict, posts: list, engagement: dict, gender: dict
+) -> Tuple[AuditReport, str]:
     audit_data = {
         "profile": profile,
         "recent_posts": posts,
@@ -904,28 +1096,63 @@ Evaluate:
 10. Actionable recommendations
 """
 
-    try:
-        # A client is created per request/thread, avoiding shared mutable client state.
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": AuditReport,
-            },
-        )
+    models = gemini_model_chain()
+    # A client is created per request/thread, avoiding shared mutable client state.
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    failures: List[str] = []
 
-        if response.parsed:
-            return response.parsed
+    for index, model in enumerate(models):
+        attempt = 1
+        while attempt <= 2:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": AuditReport,
+                    },
+                )
 
-        return AuditReport.model_validate_json(response.text)
+                if response.parsed:
+                    report = response.parsed
+                else:
+                    report = AuditReport.model_validate_json(response.text)
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini audit generation failed: {str(exc)}",
-        )
+                print(f"✅ Gemini audit produced by {model}")
+                return report, model
+
+            except HTTPException:
+                raise
+            except Exception as exc:
+                if not is_transient_gemini_error(exc):
+                    raise HTTPException(
+                        status_code=502,
+                        detail=_fatal_gemini_detail(model, exc),
+                    )
+
+                summary = _safe_error_text(exc)
+                failures.append(f"{model}: {summary}")
+                if attempt == 1 and _retry_same_model(exc):
+                    print(f"⚠️ Gemini model {model} unavailable ({summary}); retrying once")
+                    time.sleep(GEMINI_SAME_MODEL_RETRY_SECONDS)
+                    attempt += 1
+                    continue
+
+                next_model = models[index + 1] if index + 1 < len(models) else None
+                if next_model:
+                    print(
+                        f"⚠️ Gemini model {model} unavailable ({summary}); trying {next_model}"
+                    )
+                break
+
+    detail = (
+        "Gemini audit generation failed: all models were unavailable "
+        f"({', '.join(models)}). " + " | ".join(failures)
+    )
+    if len(detail) > 1500:
+        detail = detail[:1500] + "..."
+    raise HTTPException(status_code=502, detail=detail)
 
 
 # ---------------------------------------------------------
@@ -980,7 +1207,7 @@ async def run_audit_job(username: str) -> dict:
     )
 
     # Current Gemini function in this file is synchronous.
-    audit = await asyncio.to_thread(
+    audit, audit_model = await asyncio.to_thread(
         generate_ai_audit,
         profile=profile,
         posts=recent_posts,
@@ -996,6 +1223,7 @@ async def run_audit_job(username: str) -> dict:
         "engagement": engagement,
         "follower_gender": gender,
         "ai_audit": audit.model_dump(),
+        "ai_audit_model": audit_model,
     }
 
 

@@ -1,26 +1,44 @@
-import shutil
 import asyncio
+import io
+import json
 import os
 import re
+import secrets
+import threading
 import time
-import io  # <--- यह मिसिंग था
-import requests
+from collections import defaultdict, deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
 import httpx
-from PIL import Image # <--- यह मिसिंग था
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form
+import requests
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from typing import List, Optional, Dict, Any, Tuple
-from pydantic import BaseModel, Field
-import models, schemas, crud
-from database import engine, get_db
-import json
 from google import genai
+from PIL import Image
+from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+import crud
+import models
+import schemas
+from database import engine, get_db
 
 INSTA_LOOTER_HOST = "instagram-looter2.p.rapidapi.com"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+UPLOAD_HANDLER_KEY = os.getenv("UPLOAD_HANDLER_KEY")
+UPLOAD_HANDLER_URL = os.getenv(
+    "UPLOAD_HANDLER_URL",
+    "https://antimprompt.com/upload_handler.php",
+)
+HOSTINGER_PUBLIC_BASE = os.getenv("HOSTINGER_PUBLIC_BASE", "https://antimprompt.com")
+
+# Image encode defaults: keep gallery images reasonably small for the web UI.
+IMAGE_MAX_DIMENSION = int(os.getenv("IMAGE_MAX_DIMENSION", "1600"))
+IMAGE_WEBP_QUALITY = int(os.getenv("IMAGE_WEBP_QUALITY", "80"))
+THUMB_MAX_DIMENSION = int(os.getenv("THUMB_MAX_DIMENSION", "480"))
+THUMB_WEBP_QUALITY = int(os.getenv("THUMB_WEBP_QUALITY", "75"))
 
 app = FastAPI(title="Antim Prompt API")
 
@@ -35,13 +53,18 @@ http_client = httpx.AsyncClient(
 # 1. CORS Settings
 # IMPORTANT:
 # Do not use allow_origins=["*"] together with allow_credentials=True.
-# The browser frontend is running on Vite localhost:5173.
-CORS_ORIGINS = [
+# Override with CORS_ORIGINS (comma-separated) when needed.
+_DEFAULT_CORS_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://antimprompt.com",
     "https://www.antimprompt.com",
 ]
+_cors_env = os.getenv("CORS_ORIGINS") or os.getenv("ALLOWED_CORS_ORIGINS")
+if _cors_env and _cors_env.strip():
+    CORS_ORIGINS = [origin.strip() for origin in _cors_env.split(",") if origin.strip()]
+else:
+    CORS_ORIGINS = list(_DEFAULT_CORS_ORIGINS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,7 +75,7 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# 2. 'uploads' फोल्डर सेटअप (लोकल बैकअप के लिए)
+# 2. Local uploads folder (dev backup / static mount)
 UPLOAD_ROOT = "uploads"
 if not os.path.exists(UPLOAD_ROOT):
     os.makedirs(UPLOAD_ROOT)
@@ -63,28 +86,154 @@ models.Base.metadata.create_all(bind=engine)
 
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 
+
+def _keys_match(provided: Optional[str], expected: Optional[str]) -> bool:
+    """Constant-time compare; never true for missing/blank values."""
+    if not provided or not expected:
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
 def verify_admin(x_admin_key: str = Header(None)):
     # Fail closed: a missing or blank server key must reject every request.
     if not (ADMIN_KEY and ADMIN_KEY.strip()):
         raise HTTPException(status_code=503, detail="ADMIN_KEY is not configured")
-    # Never accept a missing or empty header, even if it would match a blank key.
-    if not x_admin_key or x_admin_key != ADMIN_KEY:
+    if not _keys_match(x_admin_key, ADMIN_KEY):
         raise HTTPException(status_code=401, detail="Invalid Admin Key")
     return True
+
+
+def require_upload_handler_key() -> str:
+    if not (UPLOAD_HANDLER_KEY and UPLOAD_HANDLER_KEY.strip()):
+        raise HTTPException(
+            status_code=503,
+            detail="UPLOAD_HANDLER_KEY is not configured",
+        )
+    return UPLOAD_HANDLER_KEY
+
+
+class AdminVerifyRequest(BaseModel):
+    key: str
+
+
+class SlidingWindowRateLimiter:
+    """Simple in-process sliding-window limiter (per-key)."""
+
+    def __init__(self, max_calls: int, window_seconds: float):
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self._hits: Dict[str, Deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._hits[key]
+            while bucket and now - bucket[0] >= self.window_seconds:
+                bucket.popleft()
+            if len(bucket) >= self.max_calls:
+                return False
+            bucket.append(now)
+            return True
+
+
+# Public write-ish / abuse-prone endpoints stay unauthenticated but rate-limited.
+INCREMENT_RATE_LIMITER = SlidingWindowRateLimiter(max_calls=60, window_seconds=60)
+SETTINGS_READ_RATE_LIMITER = SlidingWindowRateLimiter(max_calls=120, window_seconds=60)
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or "unknown"
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def enforce_rate_limit(limiter: SlidingWindowRateLimiter, request: Request, label: str) -> None:
+    key = f"{label}:{client_ip(request)}"
+    if not limiter.allow(key):
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+
+
+def optimize_image_bytes(
+    raw: bytes,
+    *,
+    max_dimension: int = IMAGE_MAX_DIMENSION,
+    quality: int = IMAGE_WEBP_QUALITY,
+    output_format: str = "WEBP",
+) -> bytes:
+    """Resize (long side) and re-encode; used for prompt + profile uploads."""
+    img = Image.open(io.BytesIO(raw))
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
+
+    width, height = img.size
+    longest = max(width, height)
+    if longest > max_dimension > 0:
+        scale = max_dimension / float(longest)
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    buffer = io.BytesIO()
+    fmt = output_format.upper()
+    save_kwargs: Dict[str, Any] = {"format": fmt, "quality": quality}
+    if fmt == "WEBP":
+        save_kwargs["method"] = 6
+    img.save(buffer, **save_kwargs)
+    return buffer.getvalue()
+
+
+def upload_to_hostinger_sync(
+    *,
+    file_bytes: bytes,
+    filename: str,
+    category: str,
+    content_type: str,
+) -> None:
+    """Blocking upload used from publish-prompt (sync requests)."""
+    upload_key = require_upload_handler_key()
+    response = requests.post(
+        UPLOAD_HANDLER_URL,
+        data={
+            "key": upload_key,
+            "category": category,
+            "filename": filename,
+        },
+        files={"file": (filename, file_bytes, content_type)},
+        timeout=60,
+    )
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Hostinger PHP Bridge Error")
+
 
 @app.get("/")
 def read_root():
     return {"message": "Antim Prompt API is Live!"}
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/admin/verify")
+def admin_verify(payload: AdminVerifyRequest):
+    """Frontend can check a typed admin key without calling a mutating route."""
+    if not (ADMIN_KEY and ADMIN_KEY.strip()):
+        raise HTTPException(status_code=503, detail="ADMIN_KEY is not configured")
+    if not _keys_match(payload.key, ADMIN_KEY):
+        raise HTTPException(status_code=401, detail="Invalid Admin Key")
+    return {"valid": True}
+
 
 @app.options("/ai-magic/insta-audit/{username}")
 async def insta_audit_options(username: str):
     return {"status": "ok"}
 
-# --- PUBLISH PROMPT (Fixed with correct Imports & Host URL) ---
+
+# --- PUBLISH PROMPT ---
 @app.post("/publish-prompt/")
 async def publish_prompt(
     title: str = Form(...),
@@ -93,76 +242,116 @@ async def publish_prompt(
     tags: str = Form(None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_admin)
+    authenticated: bool = Depends(verify_admin),
 ):
+    # Fail early if the Hostinger bridge key is missing (before any DB write).
+    require_upload_handler_key()
+    new_prompt = None
+
     try:
-        # 1. पहले डेटाबेस में एंट्री करें
         new_prompt = models.Prompt(
-            title=title, prompt_text=prompt_text,
-            category=category, tags=tags, image_url=""
+            title=title,
+            prompt_text=prompt_text,
+            category=category,
+            tags=tags,
+            image_url="",
         )
         db.add(new_prompt)
         db.commit()
         db.refresh(new_prompt)
 
-        # 2. इमेज को WebP में बदलें
         file_content = await file.read()
-        img = Image.open(io.BytesIO(file_content)).convert("RGB")
-        webp_buffer = io.BytesIO()
-        img.save(webp_buffer, format="WEBP", quality=95)
-        
-        # 3. फाइल का नाम (ID.webp)
-        new_filename = f"{new_prompt.id}.webp"
-        safe_category = category.strip().replace(" ", "_").lower()
-
-        # 4. Hostinger PHP Bridge को भेजें
-        php_url = "https://antimprompt.com/upload_handler.php" 
-        
-        response = requests.post(
-            php_url,
-            data={
-                "key": "my_private_storage_key_99", 
-                "category": safe_category,
-                "filename": new_filename
-            },
-            files={"file": (new_filename, webp_buffer.getvalue(), "image/webp")}
+        webp_bytes = optimize_image_bytes(
+            file_content,
+            max_dimension=IMAGE_MAX_DIMENSION,
+            quality=IMAGE_WEBP_QUALITY,
+            output_format="WEBP",
+        )
+        thumb_bytes = optimize_image_bytes(
+            file_content,
+            max_dimension=THUMB_MAX_DIMENSION,
+            quality=THUMB_WEBP_QUALITY,
+            output_format="WEBP",
         )
 
-        if response.status_code == 200:
-            # 5. DB में Final URL अपडेट करें (अब Hostinger का लिंक सेव होगा)
-            host_url = "https://antimprompt.com" 
-            final_url = f"{host_url}/uploads/{safe_category}/{new_filename}"
-            
-            new_prompt.image_url = final_url
-            db.commit()
-            return {"status": "success", "url": final_url}
-        else:
-            db.delete(new_prompt)
-            db.commit()
-            raise HTTPException(status_code=500, detail="Hostinger PHP Bridge Error")
+        new_filename = f"{new_prompt.id}.webp"
+        thumb_filename = f"{new_prompt.id}_thumb.webp"
+        safe_category = category.strip().replace(" ", "_").lower()
 
+        upload_to_hostinger_sync(
+            file_bytes=webp_bytes,
+            filename=new_filename,
+            category=safe_category,
+            content_type="image/webp",
+        )
+        upload_to_hostinger_sync(
+            file_bytes=thumb_bytes,
+            filename=thumb_filename,
+            category=safe_category,
+            content_type="image/webp",
+        )
+
+        final_url = f"{HOSTINGER_PUBLIC_BASE}/uploads/{safe_category}/{new_filename}"
+        thumbnail_url = f"{HOSTINGER_PUBLIC_BASE}/uploads/{safe_category}/{thumb_filename}"
+
+        new_prompt.image_url = final_url
+        db.commit()
+        # Keep existing `url` field; add optional thumbnail_url for newer clients.
+        return {
+            "status": "success",
+            "url": final_url,
+            "thumbnail_url": thumbnail_url,
+        }
+
+    except HTTPException:
+        if new_prompt is not None and getattr(new_prompt, "id", None) is not None:
+            try:
+                db.delete(new_prompt)
+                db.commit()
+            except Exception:
+                db.rollback()
+        else:
+            db.rollback()
+        raise
     except Exception as e:
-        db.rollback()
+        if new_prompt is not None and getattr(new_prompt, "id", None) is not None:
+            try:
+                db.delete(new_prompt)
+                db.commit()
+            except Exception:
+                db.rollback()
+        else:
+            db.rollback()
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # --- PROMPTS ---
 @app.get("/prompts/", response_model=List[schemas.Prompt])
 def read_prompts(search: str = None, category: str = None, sort_by: str = None, db: Session = Depends(get_db)):
     return crud.get_prompts(db, search=search, category=category, sort_by=sort_by)
 
+
 @app.delete("/prompts/{prompt_id}/")
 def delete_prompt(prompt_id: int, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
     db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
-    if not db_prompt: raise HTTPException(status_code=404)
+    if not db_prompt:
+        raise HTTPException(status_code=404)
     db.delete(db_prompt)
     db.commit()
     return {"message": "Deleted"}
 
+
 @app.put("/prompts/{prompt_id}/", response_model=schemas.Prompt)
-def update_prompt(prompt_id: int, prompt: schemas.PromptCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+def update_prompt(
+    prompt_id: int,
+    prompt: schemas.PromptCreate,
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_admin),
+):
     db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
-    if not db_prompt: raise HTTPException(status_code=404)
+    if not db_prompt:
+        raise HTTPException(status_code=404)
     db_prompt.title = prompt.title
     db_prompt.prompt_text = prompt.prompt_text
     db_prompt.image_url = prompt.image_url
@@ -171,21 +360,34 @@ def update_prompt(prompt_id: int, prompt: schemas.PromptCreate, db: Session = De
     db.refresh(db_prompt)
     return db_prompt
 
+
 # --- ANALYTICS ---
 @app.post("/prompts/{prompt_id}/increment/{action}/")
-def increment_stat(prompt_id: int, action: str, db: Session = Depends(get_db)):
+def increment_stat(
+    prompt_id: int,
+    action: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    enforce_rate_limit(INCREMENT_RATE_LIMITER, request, "increment")
     db_prompt = db.query(models.Prompt).filter(models.Prompt.id == prompt_id).first()
-    if not db_prompt: raise HTTPException(status_code=404)
-    if action == "view": db_prompt.views += 1
-    elif action == "copy": db_prompt.copies += 1
-    elif action == "share": db_prompt.shares += 1
+    if not db_prompt:
+        raise HTTPException(status_code=404)
+    if action == "view":
+        db_prompt.views += 1
+    elif action == "copy":
+        db_prompt.copies += 1
+    elif action == "share":
+        db_prompt.shares += 1
     db.commit()
     return {"status": "success"}
+
 
 # --- CATEGORIES ---
 @app.get("/categories/", response_model=List[schemas.Category])
 def read_categories(db: Session = Depends(get_db)):
     return crud.get_categories(db)
+
 
 @app.get("/categories/with-count/")
 def get_categories_with_count(db: Session = Depends(get_db)):
@@ -196,9 +398,15 @@ def get_categories_with_count(db: Session = Depends(get_db)):
         result.append({"id": cat.id, "name": cat.name, "prompt_count": count})
     return result
 
+
 @app.post("/categories/", response_model=schemas.Category)
-def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+def create_category(
+    category: schemas.CategoryCreate,
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_admin),
+):
     return crud.create_category(db=db, category=category)
+
 
 # --- ADMIN STATS ---
 @app.get("/admin/stats/")
@@ -207,19 +415,35 @@ def get_admin_stats(db: Session = Depends(get_db), authenticated: bool = Depends
     total_views = db.query(func.sum(models.Prompt.views)).scalar() or 0
     total_copies = db.query(func.sum(models.Prompt.copies)).scalar() or 0
     total_shares = db.query(func.sum(models.Prompt.shares)).scalar() or 0
-    return {"total_prompts": total_prompts, "total_views": total_views, "total_copies": total_copies, "total_shares": total_shares}
+    return {
+        "total_prompts": total_prompts,
+        "total_views": total_views,
+        "total_copies": total_copies,
+        "total_shares": total_shares,
+    }
+
 
 # --- SETTINGS ---
 @app.get("/settings/")
-def get_settings(db: Session = Depends(get_db)):
+def get_settings(request: Request, db: Session = Depends(get_db)):
+    # Public read for the UI timer; rate-limit to reduce scraping/abuse.
+    enforce_rate_limit(SETTINGS_READ_RATE_LIMITER, request, "settings")
     settings = db.query(models.AppSetting).all()
-    if not settings: return {"timer_enabled": "false", "timer_seconds": "5"}
+    if not settings:
+        return {"timer_enabled": "false", "timer_seconds": "5"}
     return {s.config_key: s.config_value for s in settings}
 
+
 @app.post("/settings/")
-def update_setting(key: str, value: str, db: Session = Depends(get_db), authenticated: bool = Depends(verify_admin)):
+def update_setting(
+    key: str,
+    value: str,
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_admin),
+):
     setting = db.query(models.AppSetting).filter(models.AppSetting.config_key == key).first()
-    if setting: setting.config_value = value
+    if setting:
+        setting.config_value = value
     else:
         setting = models.AppSetting(config_key=key, config_value=value)
         db.add(setting)
@@ -241,7 +465,6 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 # =========================================================
 
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY") or os.getenv("INSTA_LOOTER_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Comma-separated chain (GEMINI_MODELS). Current primary first, then other
 # stable flash models that support structured JSON via response_schema:
@@ -532,15 +755,21 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
     Important:
     - Uses the shared httpx AsyncClient; no blocking requests.post().
     - Sends Instagram-like headers because CDN URLs may reject plain clients.
-    - Uses the actual content-type returned by Instagram.
+    - Resizes/re-encodes to WebP before upload.
     - Validates the Hostinger bridge response before returning the permanent URL.
     """
     if not img_url:
         print(f"⚠️ No profile image URL for @{username}")
         return None
 
+    try:
+        upload_key = require_upload_handler_key()
+    except HTTPException as exc:
+        print(f"⚠️ Skipping profile image upload: {exc.detail}")
+        return None
+
     username = re.sub(r"[^a-zA-Z0-9_.-]", "_", username)
-    file_name = f"{username}_profile.jpg"
+    file_name = f"{username}_profile.webp"
 
     try:
         print(f"📸 Downloading Instagram profile image: @{username}")
@@ -556,7 +785,6 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             "Referer": "https://www.instagram.com/",
         }
 
-        # Some Instagram CDN URLs can be sensitive to redirects.
         img_res = await http_client.get(
             img_url,
             headers=instagram_headers,
@@ -579,39 +807,31 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             return None
 
         img_data = img_res.content
-
         if not img_data:
             print("❌ Instagram returned empty image data")
             return None
 
-        content_type = (
-            img_res.headers.get("content-type", "")
-            .split(";")[0]
-            .strip()
-            .lower()
-        )
-
-        # We save using .jpg, but if the source is another image format,
-        # Hostinger still receives the actual MIME type.
-        upload_content_type = (
-            content_type
-            if content_type.startswith("image/")
-            else "image/jpeg"
-        )
-
-        php_url = "https://antimprompt.com/upload_handler.php"
+        try:
+            img_data = optimize_image_bytes(
+                img_data,
+                max_dimension=IMAGE_MAX_DIMENSION,
+                quality=IMAGE_WEBP_QUALITY,
+                output_format="WEBP",
+            )
+        except Exception as exc:
+            print(f"⚠️ Could not optimize profile image: {exc}")
+            return None
 
         upload_data = {
-            "key": "my_private_storage_key_99",
+            "key": upload_key,
             "category": "profiles",
             "filename": file_name,
         }
-
         upload_files = {
             "file": (
                 file_name,
                 img_data,
-                upload_content_type,
+                "image/webp",
             )
         }
 
@@ -620,9 +840,8 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             f"({len(img_data)} bytes)"
         )
 
-        # IMPORTANT: httpx multipart upload is async.
         upload_response = await http_client.post(
-            php_url,
+            UPLOAD_HANDLER_URL,
             data=upload_data,
             files=upload_files,
             timeout=httpx.Timeout(30.0, connect=10.0),
@@ -640,7 +859,6 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             print("❌ Hostinger PHP bridge returned non-200")
             return None
 
-        # The bridge may return JSON or plain text.
         bridge_ok = False
         try:
             bridge_json = upload_response.json()
@@ -664,7 +882,6 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
                 bridge_ok = bool(bridge_json)
 
         except ValueError:
-            # Plain-text PHP response.
             lowered = response_text.lower()
             bridge_ok = any(
                 word in lowered
@@ -684,11 +901,10 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             return None
 
         permanent_url = (
-            "https://antimprompt.com/uploads/"
+            f"{HOSTINGER_PUBLIC_BASE}/uploads/"
             f"profiles/{file_name}"
         )
 
-        # Verify with GET only. Some Hostinger configurations disable HEAD.
         try:
             verify_response = await http_client.get(
                 permanent_url,

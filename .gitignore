@@ -1,11 +1,37 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
 # Python virtual environments
 venv/
 .venv/
 env/
 ENV/
 
-# Bytecode
+# Bytecode / caches
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local databases and uploads
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

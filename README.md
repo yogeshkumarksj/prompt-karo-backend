@@ -25,7 +25,8 @@ Without `DATABASE_URL`, the app uses a local SQLite file (`promptverse.db`). Tha
 |---|---|---|
 | `ADMIN_KEY` | Yes (admin routes) | Shared secret for admin header / verify endpoint |
 | `UPLOAD_HANDLER_KEY` | Yes (uploads) | Shared secret sent to Hostinger `upload_handler.php` |
-| `GEMINI_API_KEY` | Yes (Instagram audit) | Google Gemini API key |
+| `GEMINI_API_KEY` | Yes (Instagram audit and free AI tools) | Google Gemini API key. Use a free-tier key. |
+| `GROQ_API_KEY` | Optional | Groq free-tier fallback for Viral Insta Songs and Viral AI Art Trends |
 | `RAPIDAPI_KEY` or `INSTA_LOOTER_KEY` | Yes (RapidAPI audit) | RapidAPI Instagram Looter key |
 | `IG_GRAPH_ACCESS_TOKEN` | Yes (Graph v2 audit) | Long-lived Meta User access token |
 | `IG_BUSINESS_ACCOUNT_ID` | Yes (Graph v2 audit) | Numeric `instagram_business_account.id` (not the Facebook Page id) |
@@ -85,11 +86,119 @@ These steps follow Meta's [Instagram API with Facebook Login getting started](ht
 
 Refresh the token before it expires. A short-lived token cannot be exchanged once it has already expired.
 
+## Instagram profile score
+
+The live AI Magic tool is **Insta Reach Booster**. The page sends an Instagram username to `GET /ai-magic/insta-audit/{username}`.
+
+What one successful scan does:
+
+1. Normalize the username (strip `@`, lowercase, allow only Instagram's `letters / digits / . / _` form).
+2. Check the hard budget. A spent cap returns `429` with `Limit reached, try tomorrow.` and stops here.
+3. Load the public profile. v1 calls RapidAPI Instagram Looter `GET /profile`. v2 calls Meta Business Discovery and does not use RapidAPI.
+4. Skip Gemini when the account is private or missing. A private account returns `status: "private"` and no score.
+5. Keep the last 10 posts, compute average likes, comments, and engagement, and pass that JSON to Gemini with a fixed response schema. Follower gender is included only when the upstream payload already contains it. The model is told not to guess gender.
+6. Return `profile`, `recent_posts`, `engagement`, `follower_gender`, and `ai_audit` (overall score plus profile, content, engagement, consistency, growth, strengths, weaknesses, recommendations, content strategy, and hashtags).
+
+Results for the same username are cached in memory (`AUDIT_CACHE_TTL`, default 60 seconds) and identical in-flight scans share one upstream call (`AUDIT_MAX_CONCURRENT`).
+
+### Data sources
+
+| Route | Upstream | What it can see |
+|---|---|---|
+| `GET /ai-magic/insta-audit/{username}` | RapidAPI `instagram-looter2` `/profile` | Whatever the scraper still returns for a public web profile. Personal and professional accounts are both attempted. |
+| `GET /ai-magic/insta-audit-v2/{username}` | `graph.facebook.com` Business Discovery | Public Instagram Business and Creator accounts only. Personal accounts are a 404. |
+
+The score text itself comes from Gemini (`GEMINI_API_KEY`, model chain `GEMINI_MODELS`). v2 still calls Gemini after the Graph read.
+
+### Cost
+
+- **RapidAPI Instagram Looter** is a paid third-party subscription. Each uncached v1 scan is at least one billed `/profile` request, plus a Gemini generation. Marketplace quotas are small on the basic plan, and overage follows whatever subscription is attached to `RAPIDAPI_KEY`.
+- **Gemini** is billed by Google when the key's project has billing turned on and usage passes the free tier. A free AI Studio key stays at the provider's free quota until that quota is exhausted. This app cannot see which of those two states the key is in.
+- **Groq** is not used by the score. It is the fallback for the two free tools below.
+- **Graph API** has no RapidAPI fee. Meta rate-limits it, and the long-lived token expires in about 60 days. The Gemini call can still cost money.
+- **Profile photos** are copied onto Hostinger only when the URL is an `https` host on `cdninstagram.com`, `fbcdn.net`, or `instagram.com`. A failed copy leaves the original CDN URL in the response.
+
+The hard budget below is what stops a busy day from calling RapidAPI, Graph, or Gemini after the cap.
+
+### Risks that remain
+
+- Instagram Looter is an unofficial scraper. Instagram can change the payload, block the scraper, or serve an empty profile, and a scan then fails or scores thin data. Meta's terms restrict automated collection; v2 is the official read, limited to public professional accounts.
+- Provider rate limits surface as `429` (Graph) or `502` (RapidAPI / Gemini). The in-app cap is separate and is the one that returns `Limit reached, try tomorrow.`
+- The audit cache lives in process memory. A restart or a second Render instance does its own lookups. Raise `AUDIT_CACHE_TTL` (seconds) when a one-minute cache is causing repeat RapidAPI charges.
+- A post with hidden like counts is stored as `0` and is included in the engagement average, so the rate can look lower than the visible posts.
+- Gender counts stay empty unless the upstream JSON already has them. Business Discovery never does.
+- `X-Forwarded-For` is trusted for the per-IP limit, which matches a single Render proxy. The global cap does not depend on that header.
+- The budget row is enforced inside one process and stored in the app database so a restart does not zero it. Two app instances at the same time can each allow up to the cap.
+
+### Fixes in this pass
+
+- A null `edge_followed_by` / media block no longer crashes the scan. Follower and post counts also accept the flat `follower_count` / `media_count` fields and a profile wrapped under `user`, `data`, or `graphql.user`.
+- The string `"false"` is no longer treated as a private account.
+- Usernames that cannot be an Instagram handle are rejected before a paid lookup.
+- Profile-image downloads no longer follow arbitrary URLs from the payload, and redirects are not followed.
+- RapidAPI response bodies are not copied into the client error. Unexpected audit errors are redacted before they are returned.
+
+## Free AI tools, limits, and the budget cap
+
+The AI Magic page lists two tools that were still "Coming soon". Both now have backend routes. They are marked `billing: "free"` and do not call RapidAPI or the Graph API.
+
+| Tool | Route | Body |
+|---|---|---|
+| Viral Insta Songs | `POST /ai-magic/viral-insta-songs` | `{"niche": "fitness", "region": "India", "language": "Hindi"}` |
+| Viral AI Art Trends | `POST /ai-magic/viral-ai-art-trends` | `{"niche": "ceramics", "platform": "Instagram"}` |
+
+`region` defaults to `Global`. `language` may be empty. `platform` defaults to `Instagram`. `niche` is required.
+
+A success body includes `status`, `feature`, `billing`, `cached`, `ai_provider`, `ai_model`, the normalized `input`, a `disclaimer`, and either `songs` + `how_to_use` or `trends` + `workflow`. Song ideas are titles, artists, and original usage notes. The model is instructed not to return lyrics. Art ideas include an original image prompt. Neither route claims to have scanned Instagram live. There is no payment gateway.
+
+### Provider fallback
+
+`AI_PROVIDER_ORDER` defaults to `gemini,groq`. A provider with a blank key is skipped. The call uses the Gemini API (`GEMINI_API_KEY`, header `x-goog-api-key`) and the Groq OpenAI-compatible chat API (`GROQ_API_KEY`). A `429`, `5xx`, timeout, or invalid JSON response tries the next model, then the next provider. A `400` is retried once without JSON mode, because some free models reject `responseMimeType`. Keys are read from the environment on each call and are redacted from error text.
+
+`FREE_GEMINI_MODELS` is the free-tool Gemini chain. When it is unset, the first model in `GEMINI_MODELS` is used (default `gemini-3.6-flash`). `GROQ_MODELS` defaults to `llama-3.3-70b-versatile`. Model names that are not a short token (`letters, digits, dot, underscore, colon, hyphen`) are ignored so a bad value cannot change the request URL.
+
+Put the free-tier key in the environment. If that Google project has billing enabled, Google can still charge past the free tier, which is why the cap below refuses the call instead of assuming the provider will.
+
+### Cache
+
+Successful free-tool responses are stored for `AI_CACHE_TTL_SECONDS` (default `86400`, minimum 60) under a hash of the feature plus the case-folded input. The row is in the app database (`ai_result_cache`) and also in memory. A cache hit does not call a provider, does not spend the budget, and does not use one of the daily tries. `AI_CACHE_MAX` (default 500) drops the oldest rows.
+
+### Per-person limit
+
+Uncached generations count against the caller IP, per feature, per UTC day:
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `AI_FREE_USER_DAILY_LIMIT` | `5` | Viral Insta Songs, Viral AI Art Trends |
+| `AI_PAID_USER_DAILY_LIMIT` | `5` | both Instagram score routes |
+
+The sixth uncached songs request from the same IP returns `429` `Limit reached, try tomorrow.` A repeat of an input that is still cached still returns the saved result. IPs are stored as a salted hash (`AI_LIMIT_SALT`). `0` on either limit blocks new uncached calls for that group.
+
+### Hard budget cap
+
+Counters live in `ai_usage_counters` and survive a process restart. Before every uncached score or free-tool generation the app reserves one request and `AI_RESERVE_TOKENS_PER_CALL` tokens (default 4000). The reserve happens before RapidAPI, Graph, Gemini, or Groq. When any counter below would be exceeded, the response is HTTP `429` with exactly `Limit reached, try tomorrow.` and the provider is not called.
+
+| Variable | Default |
+|---|---|
+| `AI_BUDGET_ENABLED` | `true` |
+| `AI_GLOBAL_DAILY_REQUEST_CAP` | `40` |
+| `AI_GLOBAL_MONTHLY_REQUEST_CAP` | `800` |
+| `AI_GLOBAL_DAILY_TOKEN_CAP` | `100000` |
+| `AI_GLOBAL_MONTHLY_TOKEN_CAP` | `1500000` |
+
+Days and months use UTC. After a provider reports token usage, the token reserve is replaced with that usage. A missing usage number keeps the reserve, so a silent provider cannot erase the estimate. `AI_MAX_OUTPUT_TOKENS` (default 1024, clamped to 128–2048) caps the completion size. Setting a request cap to `0` is an off switch. `AI_BUDGET_ENABLED=false` turns the cap off for local debugging and should stay on in production.
+
+If the budget database cannot be read or written, the request fails with `503` and the provider is not called.
+
+### Paid versus free
+
+`AI_FEATURE_BILLING` overrides the built-in flags, for example `viral-insta-songs:paid,insta-audit:free`. The score routes default to `paid` because they can spend RapidAPI and Gemini. The two new tools default to `free`. `AI_BLOCK_PAID_FEATURES=true` makes every paid tool return `403` `This feature is marked paid and is not available yet.` The default is `false`, so the score keeps working. Nothing in this API collects a payment.
+
 ## Deploy on Render
 
 1. Connect this GitHub repo as a Web Service (or use `render.yaml`).
 2. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT` (also in `Procfile`).
-3. Set env vars on the Render service: `DATABASE_URL`, `ADMIN_KEY`, `UPLOAD_HANDLER_KEY`, `GEMINI_API_KEY`, `RAPIDAPI_KEY`, and for Graph v2 also `IG_GRAPH_ACCESS_TOKEN` + `IG_BUSINESS_ACCOUNT_ID`. Optionally set `CORS_ORIGINS` / `IG_GRAPH_API_VERSION`.
+3. Set env vars on the Render service: `DATABASE_URL`, `ADMIN_KEY`, `UPLOAD_HANDLER_KEY`, `GEMINI_API_KEY`, `RAPIDAPI_KEY`, and for Graph v2 also `IG_GRAPH_ACCESS_TOKEN` + `IG_BUSINESS_ACCOUNT_ID`. Optionally set `CORS_ORIGINS`, `IG_GRAPH_API_VERSION`, `GROQ_API_KEY`, and the budget caps in the free-AI section. Leave the caps at the defaults on a small site; raise them only when the free-tier quota and the RapidAPI plan can absorb the extra calls.
 4. Redeploy after changing secrets.
 
 ## Hostinger upload bridge
@@ -99,7 +208,7 @@ Refresh the token before it expires. A short-lived token cannot be exchanged onc
 ## Tests
 
 ```bash
-python -m unittest tests.test_gemini_model_fallback tests.test_ig_graph_audit -v
+python -m unittest tests.test_gemini_model_fallback tests.test_ig_graph_audit tests.test_free_ai -v
 ```
 
 ## Image uploads

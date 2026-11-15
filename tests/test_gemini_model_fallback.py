@@ -73,6 +73,7 @@ class GeminiFallbackTests(unittest.TestCase):
     def setUp(self):
         self._env = os.environ.get("GEMINI_MODELS")
         os.environ.pop("GEMINI_MODELS", None)
+        main.ai_gateway.reset_state_for_tests()
 
     def tearDown(self):
         if self._env is None:

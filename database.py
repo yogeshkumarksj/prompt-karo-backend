@@ -41,7 +41,7 @@ if SQLALCHEMY_DATABASE_URL.startswith("postgresql"):
 else:
     engine = create_engine(
         SQLALCHEMY_DATABASE_URL,
-        connect_args={"check_same_thread": False}
+        connect_args={"check_same_thread": False, "timeout": 30}
     )
 
 SessionLocal = sessionmaker(

@@ -91,6 +91,7 @@ class GraphAuditTests(unittest.TestCase):
         os.environ["GEMINI_API_KEY"] = "test-gemini-key"
         main.AUDIT_CACHE.clear()
         main.AUDIT_INFLIGHT.clear()
+        main.ai_gateway.reset_state_for_tests()
         self.previous_rapid = main.RAPIDAPI_KEY
 
     def tearDown(self):

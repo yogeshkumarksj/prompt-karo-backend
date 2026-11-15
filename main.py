@@ -1,11 +1,13 @@
 import asyncio
 import io
+import ipaddress
 import json
 import os
 import re
 import secrets
 import threading
 import time
+import urllib.parse
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -20,6 +22,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import ai_gateway
 import crud
 import models
 import schemas
@@ -694,10 +697,15 @@ def get_instagram_profile(username: str) -> dict:
             detail=f"RapidAPI request failed: {str(exc)}",
         )
 
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Instagram profile not found")
     if response.status_code != 200:
         raise HTTPException(
             status_code=502,
-            detail=f"RapidAPI returned HTTP {response.status_code}",
+            detail=(
+                f"Instagram profile lookup failed (HTTP {response.status_code}). "
+                "Please try again later."
+            ),
         )
 
     try:
@@ -734,12 +742,14 @@ async def get_instagram_profile_async(username: str) -> dict:
         )
 
         if response.status_code != 200:
-            print(f"❌ RapidAPI response: {response.text[:1000]}")
+            print(f"❌ RapidAPI /profile HTTP {response.status_code} username=@{username}")
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Instagram profile not found")
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    f"RapidAPI returned HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
+                    f"Instagram profile lookup failed (HTTP {response.status_code}). "
+                    "Please try again later."
                 ),
             )
     except httpx.HTTPStatusError as exc:
@@ -766,6 +776,30 @@ async def get_instagram_profile_async(username: str) -> dict:
 # ---------------------------------------------------------
 # Profile image -> Hostinger permanent storage
 # ---------------------------------------------------------
+_PROFILE_IMAGE_SUFFIXES = (".cdninstagram.com", ".fbcdn.net", ".instagram.com")
+
+
+def profile_image_url_allowed(url: str) -> bool:
+    """Profile images may only be fetched from Instagram's own HTTPS CDNs."""
+    if not isinstance(url, str) or not url.strip() or len(url) > 2000:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or host == "localhost" or host.endswith(".local"):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return any(host == suffix[1:] or host.endswith(suffix) for suffix in _PROFILE_IMAGE_SUFFIXES)
+
+
 async def save_profile_pic_to_hostinger(img_url: str, username: str):
     """
     Download Instagram CDN profile image and upload it to Hostinger.
@@ -778,6 +812,9 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
     """
     if not img_url:
         print(f"⚠️ No profile image URL for @{username}")
+        return None
+    if not profile_image_url_allowed(img_url):
+        print(f"⚠️ Skipping profile image with a non-Instagram URL for @{username}")
         return None
 
     try:
@@ -807,7 +844,7 @@ async def save_profile_pic_to_hostinger(img_url: str, username: str):
             img_url,
             headers=instagram_headers,
             timeout=httpx.Timeout(20.0, connect=10.0),
-            follow_redirects=True,
+            follow_redirects=False,
         )
 
         print(
@@ -1010,19 +1047,125 @@ def extract_gender_stats(data: dict, total_followers: int) -> dict:
 # Extract profile metrics
 # ---------------------------------------------------------
 
+def _as_bool(value: Any) -> bool:
+    """Coerce API booleans. The string "false" must not count as private."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _first_int(data: dict, paths: Tuple[Tuple[str, ...], ...], default: int = 0) -> int:
+    """First present numeric field. A null parent does not hide later fallbacks."""
+    for path in paths:
+        current: Any = data
+        found = True
+        for part in path:
+            if not isinstance(current, dict) or part not in current:
+                found = False
+                break
+            current = current[part]
+        if not found or current is None or isinstance(current, bool):
+            continue
+        try:
+            return int(current)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _profile_not_found(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return True
+    status = data.get("status")
+    if status is False or status == 0:
+        return True
+    if isinstance(status, str) and status.strip().lower() in {"false", "error", "not_found", "not found"}:
+        return True
+    for key in ("message", "error", "detail"):
+        value = data.get(key)
+        if isinstance(value, str) and any(
+            phrase in value.lower() for phrase in ("not found", "does not exist", "user not found")
+        ):
+            return True
+    return False
+
+
+def _looks_like_profile(data: dict) -> bool:
+    return any(
+        key in data
+        for key in (
+            "username",
+            "edge_followed_by",
+            "follower_count",
+            "followers_count",
+            "biography",
+        )
+    )
+
+
+def unwrap_profile_payload(data: dict) -> dict:
+    """Accept the web-profile shape and the wrapped shapes some providers return."""
+    if not isinstance(data, dict):
+        return {}
+    if _looks_like_profile(data):
+        return data
+    graphql = data.get("graphql")
+    if isinstance(graphql, dict) and isinstance(graphql.get("user"), dict):
+        if _looks_like_profile(graphql["user"]):
+            return graphql["user"]
+    for key in ("user", "data", "profile"):
+        inner = data.get(key)
+        if isinstance(inner, dict) and _looks_like_profile(inner):
+            return inner
+    return data
+
+
 def extract_profile_metrics(data: dict) -> dict:
+    if not isinstance(data, dict):
+        data = {}
+    full_name = data.get("full_name") or data.get("fullName") or data.get("name")
+    biography = data.get("biography") if isinstance(data.get("biography"), str) else data.get("bio")
+    pic = data.get("profile_pic_url_hd") or data.get("profile_pic_url") or data.get("profile_picture_url")
     return {
         "username": data.get("username"),
-        "full_name": data.get("full_name"),
-        "biography": data.get("biography"),
-        "followers": data.get("edge_followed_by", {}).get("count", 0),
-        "following": data.get("edge_follow", {}).get("count", 0),
-        "total_posts": data.get("edge_owner_to_timeline_media", {}).get("count", 0),
-        "is_private": data.get("is_private", False),
-        "is_verified": data.get("is_verified", False),
-        "is_professional_account": data.get("is_professional_account", False),
-        "is_business_account": data.get("is_business_account", False),
-        "profile_pic_url": data.get("profile_pic_url_hd") or data.get("profile_pic_url"),
+        "full_name": full_name if isinstance(full_name, str) else None,
+        "biography": biography if isinstance(biography, str) else None,
+        "followers": _first_int(
+            data,
+            (
+                ("edge_followed_by", "count"),
+                ("follower_count",),
+                ("followers_count",),
+                ("followers",),
+            ),
+        ),
+        "following": _first_int(
+            data,
+            (
+                ("edge_follow", "count"),
+                ("following_count",),
+                ("follows_count",),
+                ("following",),
+            ),
+        ),
+        "total_posts": _first_int(
+            data,
+            (
+                ("edge_owner_to_timeline_media", "count"),
+                ("media_count",),
+                ("posts_count",),
+                ("total_posts",),
+            ),
+        ),
+        "is_private": _as_bool(data.get("is_private")),
+        "is_verified": _as_bool(data.get("is_verified")),
+        "is_professional_account": _as_bool(data.get("is_professional_account")),
+        "is_business_account": _as_bool(data.get("is_business_account")),
+        "profile_pic_url": pic if isinstance(pic, str) else None,
     }
 
 
@@ -1030,35 +1173,89 @@ def extract_profile_metrics(data: dict) -> dict:
 # Extract last 10 posts
 # ---------------------------------------------------------
 
+def _caption_text(post: dict) -> str:
+    container = post.get("edge_media_to_caption")
+    if isinstance(container, dict):
+        edges = container.get("edges")
+        if isinstance(edges, list) and edges and isinstance(edges[0], dict):
+            node = edges[0].get("node")
+            if isinstance(node, dict) and isinstance(node.get("text"), str):
+                return node["text"]
+    caption = post.get("caption")
+    if isinstance(caption, str):
+        return caption
+    if isinstance(caption, dict) and isinstance(caption.get("text"), str):
+        return caption["text"]
+    return ""
+
+
+def _named_count(post: dict, edge_key: str, flat_keys: Tuple[str, ...]) -> int:
+    container = post.get(edge_key)
+    if isinstance(container, dict):
+        return _as_int(container.get("count"))
+    for key in flat_keys:
+        if key in post and post.get(key) is not None:
+            return _as_int(post.get(key))
+    return 0
+
+
+def _is_video_post(post: dict, typename: Any) -> bool:
+    flag = post.get("is_video")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, str):
+        return _as_bool(flag)
+    return str(typename or "").lower() in {"video", "graphvideo", "reel", "clips"}
+
+
+def _post_from_item(post: dict) -> dict:
+    typename = post.get("__typename") or post.get("media_type") or post.get("type")
+    views = 0
+    for key in ("video_view_count", "view_count", "video_views"):
+        if key in post and post.get(key) is not None:
+            views = _as_int(post.get(key))
+            break
+    return {
+        "id": post.get("id"),
+        "shortcode": post.get("shortcode"),
+        "type": typename,
+        "caption": _caption_text(post),
+        "likes": _named_count(post, "edge_liked_by", ("like_count", "likes")),
+        "comments": _named_count(post, "edge_media_to_comment", ("comments_count", "comment_count", "comments")),
+        "video_views": views,
+        "timestamp": post.get("taken_at_timestamp") or post.get("timestamp"),
+        "is_video": _is_video_post(post, typename),
+    }
+
+
 def extract_recent_posts(data: dict, limit: int = 10) -> list:
-    media = data.get("edge_owner_to_timeline_media", {})
-    edges = media.get("edges", [])
+    if not isinstance(data, dict):
+        return []
     posts = []
-
-    for edge in edges[:limit]:
-        post = edge.get("node", {})
-
-        caption_edges = post.get("edge_media_to_caption", {}).get("edges", [])
-        caption = ""
-        if caption_edges:
-            caption = caption_edges[0].get("node", {}).get("text", "")
-
-        likes = post.get("edge_liked_by", {}).get("count", 0)
-        comments = post.get("edge_media_to_comment", {}).get("count", 0)
-        video_views = post.get("video_view_count", 0) or 0
-
-        posts.append({
-            "id": post.get("id"),
-            "shortcode": post.get("shortcode"),
-            "type": post.get("__typename"),
-            "caption": caption,
-            "likes": likes,
-            "comments": comments,
-            "video_views": video_views,
-            "timestamp": post.get("taken_at_timestamp"),
-            "is_video": post.get("is_video", False),
-        })
-
+    media = data.get("edge_owner_to_timeline_media")
+    edges = media.get("edges") if isinstance(media, dict) else None
+    if isinstance(edges, list):
+        for edge in edges:
+            if len(posts) >= limit:
+                break
+            if not isinstance(edge, dict):
+                continue
+            node = edge.get("node")
+            if isinstance(node, dict):
+                posts.append(_post_from_item(node))
+    if posts:
+        return posts
+    for key in ("posts", "items", "medias"):
+        rows = data.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if len(posts) >= limit:
+                break
+            if isinstance(row, dict):
+                posts.append(_post_from_item(row))
+        if posts:
+            return posts
     return posts
 
 
@@ -1393,17 +1590,48 @@ Evaluate:
 # One complete audit job
 # ---------------------------------------------------------
 
+def _redact_audit_error(text: str) -> str:
+    for secret in (
+        RAPIDAPI_KEY,
+        GEMINI_API_KEY,
+        os.getenv("RAPIDAPI_KEY"),
+        os.getenv("INSTA_LOOTER_KEY"),
+        os.getenv("GEMINI_API_KEY"),
+        os.getenv("GROQ_API_KEY"),
+        os.getenv("IG_GRAPH_ACCESS_TOKEN"),
+    ):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = " ".join(text.split())
+    if len(text) > 300:
+        text = text[:300] + "..."
+    return text
+
+
+async def _reserve_audit(feature_id: str) -> None:
+    """Stop before any paid upstream call once the hard budget is spent."""
+    await asyncio.to_thread(
+        ai_gateway.begin_generation,
+        feature_id,
+        ai_gateway.current_client_key(),
+    )
+
+
 async def run_audit_job(username: str) -> dict:
     """Complete non-blocking audit job for one username."""
+    if not _IG_USERNAME_RE.fullmatch(username or ""):
+        raise HTTPException(status_code=400, detail="Instagram username is invalid")
+    await _reserve_audit("insta-audit")
     raw_profile = await get_instagram_profile_async(username)
 
-    if raw_profile.get("status") is False:
+    if not isinstance(raw_profile, dict) or _profile_not_found(raw_profile):
         raise HTTPException(
             status_code=404,
             detail="Instagram profile not found",
         )
 
-    profile = extract_profile_metrics(raw_profile)
+    profile_data = unwrap_profile_payload(raw_profile)
+    profile = extract_profile_metrics(profile_data)
 
     if profile.get("is_private"):
         return {
@@ -1412,6 +1640,9 @@ async def run_audit_job(username: str) -> dict:
             "profile": profile,
             "message": "Account is private. Make it public first!",
         }
+
+    if not profile.get("username"):
+        raise HTTPException(status_code=404, detail="Instagram profile not found")
 
     # Persist profile image on Hostinger.
     original_url = profile.get("profile_pic_url")
@@ -1428,7 +1659,7 @@ async def run_audit_job(username: str) -> dict:
         )
 
     recent_posts = extract_recent_posts(
-        raw_profile,
+        profile_data,
         limit=10,
     )
     engagement = calculate_engagement(
@@ -1436,7 +1667,7 @@ async def run_audit_job(username: str) -> dict:
         recent_posts,
     )
     gender = extract_follower_gender(
-        raw_profile,
+        profile_data,
         profile["followers"],
     )
 
@@ -1827,6 +2058,9 @@ async def fetch_business_discovery(username: str) -> dict:
 
 async def run_graph_audit_job(username: str) -> dict:
     """Audit one username using Graph Business Discovery and the shared Gemini chain."""
+    if not _IG_USERNAME_RE.fullmatch(username or ""):
+        raise HTTPException(status_code=400, detail="Instagram username is invalid")
+    await _reserve_audit("insta-audit-v2")
     discovery = await fetch_business_discovery(username)
     profile = map_graph_profile(discovery)
 
@@ -1867,7 +2101,7 @@ async def run_graph_audit_job(username: str) -> dict:
 # ---------------------------------------------------------
 
 @app.get("/ai-magic/insta-audit/{username}")
-async def instagram_audit(username: str):
+async def instagram_audit(username: str, request: Request):
     username = username.strip().lstrip("@").lower()
 
     if not username:
@@ -1876,21 +2110,35 @@ async def instagram_audit(username: str):
             detail="Instagram username is required",
         )
 
+    if not _IG_USERNAME_RE.fullmatch(username):
+        raise HTTPException(status_code=400, detail="Instagram username is invalid")
+
     if not RAPIDAPI_KEY:
         raise HTTPException(
             status_code=500,
             detail="RAPIDAPI_KEY is not configured",
         )
 
-    if not GEMINI_API_KEY:
+    if not (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY):
         raise HTTPException(
             status_code=500,
             detail="GEMINI_API_KEY is not configured",
         )
 
+    caller = client_ip(request)
+
+    async def runner(name: str) -> dict:
+        # Set inside the worker task so the budget sees this caller even when
+        # the lookup is scheduled on a new asyncio task.
+        token = ai_gateway.set_client_key(caller)
+        try:
+            return await run_audit_job(name)
+        finally:
+            ai_gateway.reset_client_key(token)
+
     try:
         print(f"🚀 Audit request received: @{username}")
-        result = await get_cached_or_run_audit(username)
+        result = await get_cached_or_run_audit(username, runner=runner)
         print(f"✅ Audit completed: @{username}")
         return result
 
@@ -1898,10 +2146,11 @@ async def instagram_audit(username: str):
         raise
 
     except Exception as exc:
-        print(f"🔥 AUDIT ERROR @{username}: {type(exc).__name__}: {exc}")
+        safe = _redact_audit_error(f"{type(exc).__name__}: {exc}")
+        print(f"🔥 AUDIT ERROR @{username}: {safe}")
         raise HTTPException(
             status_code=500,
-            detail=f"Instagram audit failed: {type(exc).__name__}: {str(exc)}",
+            detail=f"Instagram audit failed: {safe}",
         )
 
 
@@ -1911,7 +2160,7 @@ async def insta_audit_v2_options(username: str):
 
 
 @app.get("/ai-magic/insta-audit-v2/{username}")
-async def instagram_audit_v2(username: str):
+async def instagram_audit_v2(username: str, request: Request):
     """Public Business/Creator audit via Instagram Graph Business Discovery."""
     username = username.strip().lstrip("@").lower()
 
@@ -1920,6 +2169,9 @@ async def instagram_audit_v2(username: str):
             status_code=400,
             detail="Instagram username is required",
         )
+
+    if not _IG_USERNAME_RE.fullmatch(username):
+        raise HTTPException(status_code=400, detail="Instagram username is invalid")
 
     # Validate configuration before touching the cache so a missing token
     # fails the same way on every request.
@@ -1931,11 +2183,20 @@ async def instagram_audit_v2(username: str):
             detail="GEMINI_API_KEY is not configured",
         )
 
+    caller = client_ip(request)
+
+    async def runner(name: str) -> dict:
+        token = ai_gateway.set_client_key(caller)
+        try:
+            return await run_graph_audit_job(name)
+        finally:
+            ai_gateway.reset_client_key(token)
+
     try:
         print(f"🚀 Graph audit request received: @{username}")
         result = await get_cached_or_run_audit(
             username,
-            runner=run_graph_audit_job,
+            runner=runner,
             cache_key=f"graph:{username}",
         )
         print(f"✅ Graph audit completed: @{username}")
@@ -1945,7 +2206,7 @@ async def instagram_audit_v2(username: str):
         raise
 
     except Exception as exc:
-        safe = _redact_graph_secret(f"{type(exc).__name__}: {exc}")
+        safe = _redact_audit_error(_redact_graph_secret(f"{type(exc).__name__}: {exc}"))
         print(f"🔥 GRAPH AUDIT ERROR @{username}: {safe}")
         raise HTTPException(
             status_code=500,
@@ -1953,6 +2214,28 @@ async def instagram_audit_v2(username: str):
         )
 
 
+@app.post("/ai-magic/viral-insta-songs")
+async def viral_insta_songs(body: ai_gateway.ViralSongsRequest, request: Request):
+    """Free-tier audio ideas for one niche. Cached, rate limited, and budget capped."""
+    return await ai_gateway.viral_insta_songs(
+        niche=body.niche,
+        region=body.region,
+        language=body.language,
+        client_key=client_ip(request),
+    )
+
+
+@app.post("/ai-magic/viral-ai-art-trends")
+async def viral_ai_art_trends(body: ai_gateway.ViralArtRequest, request: Request):
+    """Free-tier AI image trends and original prompts. Cached, rate limited, and budget capped."""
+    return await ai_gateway.viral_ai_art_trends(
+        niche=body.niche,
+        platform=body.platform,
+        client_key=client_ip(request),
+    )
+
+
 @app.on_event("shutdown")
 async def shutdown_http_client():
     await http_client.aclose()
+    await ai_gateway.aclose()

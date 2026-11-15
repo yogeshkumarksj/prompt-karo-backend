@@ -35,3 +35,21 @@ class Waitlist(Base):
     email = Column(String)
     whatsapp = Column(String)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AiUsageCounter(Base):
+    """Persisted request and token counters for the AI budget cap."""
+
+    __tablename__ = "ai_usage_counters"
+    bucket = Column(String, primary_key=True)
+    amount = Column(Integer, nullable=False, default=0)
+
+
+class AiResultCache(Base):
+    """Cached free-feature results so repeat inputs do not call a provider."""
+
+    __tablename__ = "ai_result_cache"
+    cache_key = Column(String, primary_key=True)
+    payload = Column(Text, nullable=False)
+    created_at = Column(Integer, nullable=False, index=True)
+    expires_at = Column(Integer, nullable=False, index=True)

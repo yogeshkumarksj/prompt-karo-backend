@@ -53,6 +53,10 @@ DEFAULT_BILLING = {
 
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 _client_key: contextvars.ContextVar[str] = contextvars.ContextVar("ai_client_key", default="")
+# None uses AI_MAX_OUTPUT_TOKENS (clamped to 2048). Browse batches set a higher cap.
+_output_limit: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "ai_output_limit", default=None
+)
 _lock = threading.Lock()
 _mem_cache: Dict[str, Tuple[int, dict]] = {}
 _inflight: Dict[str, asyncio.Task] = {}
@@ -392,6 +396,11 @@ def begin_generation(feature_id: str, client_key: Optional[str] = None) -> None:
         deltas[user_bucket] = 1
         caps[user_bucket] = _user_daily_limit(feature_billing(feature_id))
 
+    _commit_usage(deltas, caps, feature_id)
+
+
+def _commit_usage(deltas: Dict[str, int], caps: Dict[str, int], feature_id: str) -> None:
+    """Add counters in one transaction, or refuse without leaving a partial update."""
     with _lock:
         last_error: Optional[BaseException] = None
         for _attempt in range(2):
@@ -427,6 +436,89 @@ def begin_generation(feature_id: str, client_key: Optional[str] = None) -> None:
                 db.close()
         print(f"AI budget check failed closed: {type(last_error).__name__ if last_error else 'retry'}")
         raise HTTPException(status_code=503, detail=BUDGET_UNAVAILABLE_MESSAGE)
+
+
+def browse_daily_request_cap() -> int:
+    """Scheduled songs + art refreshes. Separate from AI_GLOBAL_DAILY_REQUEST_CAP."""
+    return _cap_env("VIRAL_BROWSE_DAILY_REQUEST_CAP", 16)
+
+
+def browse_daily_token_cap() -> int:
+    return _cap_env("VIRAL_BROWSE_DAILY_TOKEN_CAP", 140_000)
+
+
+def browse_reserve_tokens() -> int:
+    value = _cap_env("VIRAL_BROWSE_RESERVE_TOKENS", 8000)
+    if value < 500:
+        return 500
+    return min(value, 16000)
+
+
+def generation_hard_off() -> bool:
+    """A global cap of 0 is the off switch for every provider call, including browse."""
+    if not _bool_env("AI_BUDGET_ENABLED", True):
+        return False
+    switches = (
+        ("AI_GLOBAL_DAILY_REQUEST_CAP", 40),
+        ("AI_GLOBAL_MONTHLY_REQUEST_CAP", 800),
+        ("AI_GLOBAL_DAILY_TOKEN_CAP", 100_000),
+        ("AI_GLOBAL_MONTHLY_TOKEN_CAP", 1_500_000),
+    )
+    return any(_cap_env(name, default) == 0 for name, default in switches)
+
+
+def begin_browse_generation() -> None:
+    """Reserve one scheduled browse call.
+
+    Counts against the browse buckets only, so interactive songs, art, and
+    audit requests keep the global cap. Does not record a per-user daily try.
+    """
+    if not _bool_env("AI_BUDGET_ENABLED", True):
+        return
+    if generation_hard_off():
+        print("AI limit reached feature=viral-browse bucket=global-off")
+        raise HTTPException(status_code=429, detail=LIMIT_MESSAGE)
+    day, _month = _now_parts()
+    reserve = browse_reserve_tokens()
+    req_bucket = f"browse:req:day:{day}"
+    tok_bucket = f"browse:tok:day:{day}"
+    _commit_usage(
+        {req_bucket: 1, tok_bucket: reserve},
+        {
+            req_bucket: browse_daily_request_cap(),
+            tok_bucket: browse_daily_token_cap(),
+        },
+        "viral-browse",
+    )
+
+
+def settle_browse_tokens(actual: int) -> None:
+    """Replace the browse token reserve with the provider's reported usage."""
+    if not _bool_env("AI_BUDGET_ENABLED", True):
+        return
+    try:
+        actual_tokens = int(actual)
+    except (TypeError, ValueError):
+        return
+    if actual_tokens <= 0:
+        return
+    delta = actual_tokens - browse_reserve_tokens()
+    if delta == 0:
+        return
+    day, _month = _now_parts()
+    bucket = f"browse:tok:day:{day}"
+    with _lock:
+        db = SessionLocal()
+        try:
+            row = db.query(models.AiUsageCounter).filter_by(bucket=bucket).one_or_none()
+            if row is not None:
+                row.amount = max(0, int(row.amount) + delta)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            print(f"AI browse token settle skipped: {type(exc).__name__}")
+        finally:
+            db.close()
 
 
 def settle_tokens(actual: int) -> None:
@@ -592,11 +684,27 @@ def _cache_key(feature_id: str, payload: dict) -> str:
     return f"{feature_id}:v1:{digest}"
 
 
+def set_output_limit(value: Optional[int]):
+    """Override the completion size for the current task. None clears it."""
+    if value is None:
+        return _output_limit.set(None)
+    return _output_limit.set(int(value))
+
+
+def reset_output_limit(token) -> None:
+    _output_limit.reset(token)
+
+
 def max_output_tokens() -> int:
-    value = _cap_env("AI_MAX_OUTPUT_TOKENS", 1024)
-    if value < 128:
+    override = _output_limit.get()
+    if override is None:
+        value = _cap_env("AI_MAX_OUTPUT_TOKENS", 1024)
+        if value < 128:
+            return 128
+        return min(value, 2048)
+    if override < 128:
         return 128
-    return min(value, 2048)
+    return min(override, 8192)
 
 
 async def _post(url: str, *, headers: dict, body: dict, timeout: float):

@@ -46,6 +46,7 @@ ART_DISCLAIMER = (
 DEFAULT_BILLING = {
     "insta-audit": "paid",
     "insta-audit-v2": "paid",
+    "insta-audit-auto": "paid",
     "viral-insta-songs": "free",
     "viral-ai-art-trends": "free",
 }
@@ -290,7 +291,7 @@ def _hash_client(client_key: str) -> str:
 
 
 def redact_secrets(text: str) -> str:
-    for name in (
+    names = [
         "GEMINI_API_KEY",
         "GROQ_API_KEY",
         "RAPIDAPI_KEY",
@@ -298,10 +299,11 @@ def redact_secrets(text: str) -> str:
         "IG_GRAPH_ACCESS_TOKEN",
         "ADMIN_KEY",
         "UPLOAD_HANDLER_KEY",
-    ):
-        secret = os.getenv(name)
-        if secret:
-            text = text.replace(secret, "[redacted]")
+    ]
+    names.extend(f"RAPIDAPI_KEY_{index}" for index in range(1, 11))
+    secrets = [os.getenv(name) for name in names]
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
     return text
 
 

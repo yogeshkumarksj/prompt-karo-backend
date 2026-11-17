@@ -468,7 +468,13 @@ def join_waitlist(data: schemas.WaitlistCreate, db: Session = Depends(get_db)):
 # Optimized for concurrent requests / multi-user traffic
 # =========================================================
 
+# Legacy single key. Numbered RAPIDAPI_KEY_1..10 are read at call time.
+# Tests and older deploys still assign this module global.
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY") or os.getenv("INSTA_LOOTER_KEY")
+# Exact client message when every configured RapidAPI key is over quota.
+RAPIDAPI_KEYS_EXHAUSTED_DETAIL = "we are getting too much request, please wait"
+_RAPIDAPI_EXHAUSTED_UNTIL: Dict[str, float] = {}
+_RAPIDAPI_KEY_LOCK = threading.Lock()
 
 # Comma-separated chain (GEMINI_MODELS). Current primary first, then other
 # stable flash models that support structured JSON via response_schema:
@@ -674,103 +680,259 @@ def extract_follower_gender(data: dict, followers: int) -> dict:
 
 
 # ---------------------------------------------------------
-# RapidAPI
+# RapidAPI (numbered keys, then the legacy key)
 # ---------------------------------------------------------
 
-def get_instagram_profile(username: str) -> dict:
-    headers = {
+class _RapidAPIKeyExhausted(Exception):
+    """This RapidAPI key is over its quota. Try the next configured key."""
+
+
+def _rapidapi_cooldown_seconds() -> float:
+    raw = os.getenv("RAPIDAPI_KEY_COOLDOWN_SECONDS")
+    if raw is None or not str(raw).strip():
+        return 60.0
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return 60.0
+    if value < 0:
+        return 60.0
+    return value
+
+
+def _add_rapidapi_key(ordered: List[str], seen: set, value: Optional[str]) -> None:
+    if not isinstance(value, str):
+        return
+    cleaned = value.strip()
+    if not cleaned or cleaned in seen:
+        return
+    seen.add(cleaned)
+    ordered.append(cleaned)
+
+
+def _configured_rapidapi_keys() -> List[str]:
+    """RAPIDAPI_KEY_1..10, then RAPIDAPI_KEY, INSTA_LOOTER_KEY, and the module key.
+
+    Duplicates are dropped. The module global stays so tests and older
+    deployments that assign RAPIDAPI_KEY directly are still a real key.
+    """
+    ordered: List[str] = []
+    seen: set = set()
+    for index in range(1, 11):
+        _add_rapidapi_key(ordered, seen, os.getenv(f"RAPIDAPI_KEY_{index}"))
+    _add_rapidapi_key(ordered, seen, os.getenv("RAPIDAPI_KEY"))
+    _add_rapidapi_key(ordered, seen, os.getenv("INSTA_LOOTER_KEY"))
+    _add_rapidapi_key(ordered, seen, RAPIDAPI_KEY)
+    return ordered
+
+
+def _rapidapi_configured() -> bool:
+    return bool(_configured_rapidapi_keys())
+
+
+def _note_rapidapi_key_exhausted(key: str) -> None:
+    delay = _rapidapi_cooldown_seconds()
+    with _RAPIDAPI_KEY_LOCK:
+        _RAPIDAPI_EXHAUSTED_UNTIL[key] = time.monotonic() + delay
+
+
+def _usable_rapidapi_keys() -> List[str]:
+    now = time.monotonic()
+    with _RAPIDAPI_KEY_LOCK:
+        expired = [
+            key for key, until in _RAPIDAPI_EXHAUSTED_UNTIL.items() if until <= now
+        ]
+        for key in expired:
+            _RAPIDAPI_EXHAUSTED_UNTIL.pop(key, None)
+        cooled = set(_RAPIDAPI_EXHAUSTED_UNTIL)
+    return [key for key in _configured_rapidapi_keys() if key not in cooled]
+
+
+def clear_rapidapi_key_cooldowns() -> None:
+    with _RAPIDAPI_KEY_LOCK:
+        _RAPIDAPI_EXHAUSTED_UNTIL.clear()
+
+
+def _select_rapidapi_keys() -> List[str]:
+    if not _configured_rapidapi_keys():
+        raise HTTPException(
+            status_code=500,
+            detail="RAPIDAPI_KEY is not configured",
+        )
+    usable = _usable_rapidapi_keys()
+    if not usable:
+        raise HTTPException(
+            status_code=429,
+            detail=RAPIDAPI_KEYS_EXHAUSTED_DETAIL,
+        )
+    return usable
+
+
+def _rapidapi_headers(key: str) -> dict:
+    return {
         "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-key": key,
     }
 
-    params = {"username": username}
 
+def _rapidapi_response_body(response: Any) -> str:
     try:
-        response = requests.get(
-            RAPIDAPI_URL,
-            headers=headers,
-            params=params,
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"RapidAPI request failed: {str(exc)}",
-        )
+        text = response.text
+    except Exception:
+        return ""
+    if isinstance(text, bytes):
+        return text.decode("utf-8", errors="replace")
+    return text if isinstance(text, str) else ""
 
-    if response.status_code == 404:
+
+def _rapidapi_text_mentions_quota(text: str) -> bool:
+    lowered = (text or "").lower()
+    if "rate limit" in lowered:
+        return True
+    return re.search(r"exceeded the\s+.{0,80}?quota", lowered) is not None
+
+
+def _rapidapi_key_exhausted(status_code: int, body_text: str, payload: Any = None) -> bool:
+    """True for quota / rate-limit responses that should try the next key.
+
+    HTTP 429 always rotates. HTTP 403 rotates when the body talks about the
+    subscription or quota. A body that says the quota was exceeded, or that a
+    rate limit was hit, rotates on any status that is not a real profile.
+    """
+    if status_code == 429:
+        return True
+    lowered = (body_text or "").lower()
+    if status_code == 403 and any(
+        token in lowered for token in ("quota", "subscription", "subscribed")
+    ):
+        return True
+    mentions_quota = _rapidapi_text_mentions_quota(body_text)
+    if status_code != 200 and mentions_quota:
+        return True
+    if status_code == 200 and mentions_quota:
+        if not isinstance(payload, dict):
+            return True
+        unwrapped = unwrap_profile_payload(payload)
+        if not _looks_like_profile(payload) and not _looks_like_profile(unwrapped):
+            return True
+    return False
+
+
+def _profile_from_rapidapi_response(response: Any) -> dict:
+    body_text = _rapidapi_response_body(response)
+    status_code = int(response.status_code)
+    if status_code != 200 and _rapidapi_key_exhausted(status_code, body_text):
+        raise _RapidAPIKeyExhausted()
+    if status_code == 404:
         raise HTTPException(status_code=404, detail="Instagram profile not found")
-    if response.status_code != 200:
+    if status_code != 200:
         raise HTTPException(
             status_code=502,
             detail=(
-                f"Instagram profile lookup failed (HTTP {response.status_code}). "
+                f"Instagram profile lookup failed (HTTP {status_code}). "
                 "Please try again later."
             ),
         )
-
     try:
-        return response.json()
+        payload = response.json()
     except ValueError:
+        if _rapidapi_key_exhausted(status_code, body_text):
+            raise _RapidAPIKeyExhausted()
         raise HTTPException(
             status_code=502,
             detail="RapidAPI returned invalid JSON",
         )
+    if _rapidapi_key_exhausted(status_code, body_text, payload):
+        raise _RapidAPIKeyExhausted()
+    return payload
 
+
+def _rapidapi_transport_error(exc: BaseException) -> HTTPException:
+    # _redact_audit_error is defined later and covers every configured key.
+    detail = _redact_audit_error(f"RapidAPI request failed: {exc}")
+    return HTTPException(status_code=502, detail=detail)
+
+
+def get_instagram_profile(username: str) -> dict:
+    keys = _select_rapidapi_keys()
+    for index, key in enumerate(keys, start=1):
+        try:
+            response = requests.get(
+                RAPIDAPI_URL,
+                headers=_rapidapi_headers(key),
+                params={"username": username},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise _rapidapi_transport_error(exc)
+
+        print(
+            f"📡 RapidAPI /profile: HTTP {response.status_code} "
+            f"username=@{username} key={index}/{len(keys)}"
+        )
+        try:
+            return _profile_from_rapidapi_response(response)
+        except _RapidAPIKeyExhausted:
+            _note_rapidapi_key_exhausted(key)
+            print(
+                f"⚠️ RapidAPI key {index}/{len(keys)} quota exhausted "
+                f"username=@{username}"
+            )
+            continue
+        except HTTPException:
+            if response.status_code != 200:
+                print(
+                    f"❌ RapidAPI /profile HTTP {response.status_code} "
+                    f"username=@{username}"
+                )
+            raise
+
+    raise HTTPException(status_code=429, detail=RAPIDAPI_KEYS_EXHAUSTED_DETAIL)
 
 
 # ---------------------------------------------------------
 # Async RapidAPI profile call
 # ---------------------------------------------------------
 async def get_instagram_profile_async(username: str) -> dict:
-    headers = {
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": RAPIDAPI_KEY,
-    }
-
-    try:
-        response = await http_client.get(
-            RAPIDAPI_URL,
-            headers=headers,
-            params={"username": username},
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            follow_redirects=True,
-        )
+    keys = _select_rapidapi_keys()
+    for index, key in enumerate(keys, start=1):
+        try:
+            response = await http_client.get(
+                RAPIDAPI_URL,
+                headers=_rapidapi_headers(key),
+                params={"username": username},
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+            )
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            if response is None:
+                raise _rapidapi_transport_error(exc)
+        except httpx.RequestError as exc:
+            raise _rapidapi_transport_error(exc)
 
         print(
             f"📡 RapidAPI /profile: HTTP {response.status_code} "
-            f"username=@{username}"
+            f"username=@{username} key={index}/{len(keys)}"
         )
-
-        if response.status_code != 200:
-            print(f"❌ RapidAPI /profile HTTP {response.status_code} username=@{username}")
-            if response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Instagram profile not found")
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Instagram profile lookup failed (HTTP {response.status_code}). "
-                    "Please try again later."
-                ),
+        try:
+            return _profile_from_rapidapi_response(response)
+        except _RapidAPIKeyExhausted:
+            _note_rapidapi_key_exhausted(key)
+            print(
+                f"⚠️ RapidAPI key {index}/{len(keys)} quota exhausted "
+                f"username=@{username}"
             )
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"RapidAPI returned HTTP {exc.response.status_code}",
-        )
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"RapidAPI request failed: {str(exc)}",
-        )
+            continue
+        except HTTPException:
+            if response.status_code != 200:
+                print(
+                    f"❌ RapidAPI /profile HTTP {response.status_code} "
+                    f"username=@{username}"
+                )
+            raise
 
-    try:
-        return response.json()
-    except ValueError:
-        raise HTTPException(
-            status_code=502,
-            detail="RapidAPI returned invalid JSON",
-        )
+    raise HTTPException(status_code=429, detail=RAPIDAPI_KEYS_EXHAUSTED_DETAIL)
 
 
 
@@ -1592,7 +1754,7 @@ Evaluate:
 # ---------------------------------------------------------
 
 def _redact_audit_error(text: str) -> str:
-    for secret in (
+    secrets: List[Optional[str]] = [
         RAPIDAPI_KEY,
         GEMINI_API_KEY,
         os.getenv("RAPIDAPI_KEY"),
@@ -1600,9 +1762,24 @@ def _redact_audit_error(text: str) -> str:
         os.getenv("GEMINI_API_KEY"),
         os.getenv("GROQ_API_KEY"),
         os.getenv("IG_GRAPH_ACCESS_TOKEN"),
-    ):
-        if secret:
-            text = text.replace(secret, "[redacted]")
+    ]
+    for index in range(1, 11):
+        secrets.append(os.getenv(f"RAPIDAPI_KEY_{index}"))
+    secrets.extend(_configured_rapidapi_keys())
+    with _RAPIDAPI_KEY_LOCK:
+        secrets.extend(_RAPIDAPI_EXHAUSTED_UNTIL.keys())
+    seen = set()
+    ordered: List[str] = []
+    for secret in secrets:
+        if not isinstance(secret, str):
+            continue
+        cleaned = secret.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        ordered.append(cleaned)
+    for secret in sorted(ordered, key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
     text = " ".join(text.split())
     if len(text) > 300:
         text = text[:300] + "..."
@@ -1618,11 +1795,12 @@ async def _reserve_audit(feature_id: str) -> None:
     )
 
 
-async def run_audit_job(username: str) -> dict:
+async def run_audit_job(username: str, *, reserve: bool = True) -> dict:
     """Complete non-blocking audit job for one username."""
     if not _IG_USERNAME_RE.fullmatch(username or ""):
         raise HTTPException(status_code=400, detail="Instagram username is invalid")
-    await _reserve_audit("insta-audit")
+    if reserve:
+        await _reserve_audit("insta-audit")
     raw_profile = await get_instagram_profile_async(username)
 
     if not isinstance(raw_profile, dict) or _profile_not_found(raw_profile):
@@ -1796,6 +1974,19 @@ def ig_graph_credentials() -> Tuple[str, str, str]:
             ),
         )
     return token, account_id, ig_graph_api_version()
+
+
+def ig_graph_configured() -> bool:
+    """True when a Business Discovery call can be attempted. Does not raise."""
+    token = (os.getenv("IG_GRAPH_ACCESS_TOKEN") or "").strip()
+    account_id = (os.getenv("IG_BUSINESS_ACCOUNT_ID") or "").strip()
+    if not token or not re.fullmatch(r"\d+", account_id):
+        return False
+    try:
+        ig_graph_api_version()
+    except HTTPException:
+        return False
+    return True
 
 
 def business_discovery_fields(username: str, include_extended: bool = True) -> str:
@@ -2057,12 +2248,19 @@ async def fetch_business_discovery(username: str) -> dict:
     )
 
 
-async def run_graph_audit_job(username: str) -> dict:
+async def run_graph_audit_job(
+    username: str,
+    *,
+    reserve: bool = True,
+    discovery: Optional[dict] = None,
+) -> dict:
     """Audit one username using Graph Business Discovery and the shared Gemini chain."""
     if not _IG_USERNAME_RE.fullmatch(username or ""):
         raise HTTPException(status_code=400, detail="Instagram username is invalid")
-    await _reserve_audit("insta-audit-v2")
-    discovery = await fetch_business_discovery(username)
+    if reserve:
+        await _reserve_audit("insta-audit-v2")
+    if discovery is None:
+        discovery = await fetch_business_discovery(username)
     profile = map_graph_profile(discovery)
 
     original_url = profile.get("profile_pic_url")
@@ -2097,6 +2295,51 @@ async def run_graph_audit_job(username: str) -> dict:
     }
 
 
+def _graph_discovery_usable(discovery: Any) -> bool:
+    """A Business Discovery payload we can score without calling RapidAPI."""
+    if not isinstance(discovery, dict):
+        return False
+    username = discovery.get("username")
+    return isinstance(username, str) and bool(username.strip())
+
+
+def _log_graph_fallback(username: str, detail: Any) -> None:
+    safe = _redact_audit_error(_redact_graph_secret(str(detail or "")))
+    print(f"⚠️ Graph audit unavailable for @{username}: {safe}; trying RapidAPI")
+
+
+async def run_auto_audit_job(username: str) -> dict:
+    """Try Graph first. Fall back to RapidAPI without a second budget reserve.
+
+    The reserve happens once, before either upstream call, under
+    insta-audit-auto. The inner jobs skip their own reserve. Gemini runs only
+    inside the source that actually returned a profile, so a Graph miss does
+    not call Gemini and then call it again on the RapidAPI path.
+    """
+    if not _IG_USERNAME_RE.fullmatch(username or ""):
+        raise HTTPException(status_code=400, detail="Instagram username is invalid")
+    await _reserve_audit("insta-audit-auto")
+
+    if ig_graph_configured():
+        discovery = None
+        try:
+            discovery = await fetch_business_discovery(username)
+        except HTTPException as exc:
+            _log_graph_fallback(username, exc.detail)
+        except Exception as exc:
+            _log_graph_fallback(username, f"{type(exc).__name__}: {exc}")
+        if _graph_discovery_usable(discovery):
+            result = await run_graph_audit_job(
+                username,
+                reserve=False,
+                discovery=discovery,
+            )
+            return {**result, "source": "graph"}
+
+    result = await run_audit_job(username, reserve=False)
+    return {**result, "source": "rapidapi"}
+
+
 # ---------------------------------------------------------
 # FINAL API
 # ---------------------------------------------------------
@@ -2114,7 +2357,7 @@ async def instagram_audit(username: str, request: Request):
     if not _IG_USERNAME_RE.fullmatch(username):
         raise HTTPException(status_code=400, detail="Instagram username is invalid")
 
-    if not RAPIDAPI_KEY:
+    if not _rapidapi_configured():
         raise HTTPException(
             status_code=500,
             detail="RAPIDAPI_KEY is not configured",
@@ -2212,6 +2455,70 @@ async def instagram_audit_v2(username: str, request: Request):
         raise HTTPException(
             status_code=500,
             detail=f"Instagram Graph audit failed: {safe}",
+        )
+
+
+@app.options("/ai-magic/insta-audit-auto/{username}")
+async def insta_audit_auto_options(username: str):
+    return {"status": "ok"}
+
+
+@app.get("/ai-magic/insta-audit-auto/{username}")
+async def instagram_audit_auto(username: str, request: Request):
+    """Graph Business Discovery first, then RapidAPI when Graph cannot score it."""
+    username = username.strip().lstrip("@").lower()
+
+    if not username:
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram username is required",
+        )
+
+    if not _IG_USERNAME_RE.fullmatch(username):
+        raise HTTPException(status_code=400, detail="Instagram username is invalid")
+
+    # A configured Graph token can satisfy the request alone. When Graph is
+    # missing, RapidAPI has to be configured or there is nothing to call.
+    if not ig_graph_configured() and not _rapidapi_configured():
+        raise HTTPException(
+            status_code=500,
+            detail="RAPIDAPI_KEY is not configured",
+        )
+
+    if not (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY):
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not configured",
+        )
+
+    caller = client_ip(request)
+
+    async def runner(name: str) -> dict:
+        token = ai_gateway.set_client_key(caller)
+        try:
+            return await run_auto_audit_job(name)
+        finally:
+            ai_gateway.reset_client_key(token)
+
+    try:
+        print(f"🚀 Auto audit request received: @{username}")
+        result = await get_cached_or_run_audit(
+            username,
+            runner=runner,
+            cache_key=f"auto:{username}",
+        )
+        print(f"✅ Auto audit completed: @{username} source={result.get('source')}")
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        safe = _redact_audit_error(_redact_graph_secret(f"{type(exc).__name__}: {exc}"))
+        print(f"🔥 AUTO AUDIT ERROR @{username}: {safe}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Instagram audit failed: {safe}",
         )
 
 

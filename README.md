@@ -2,7 +2,7 @@
 
 FastAPI backend for [antimprompt.com](https://antimprompt.com). The frontend lives in a separate Vite React repo (`yogeshkumarksj/antim_prompt_web_ui`). Production API: `https://prompt-karo-backend.onrender.com`. Prompt images are uploaded through a PHP bridge on Hostinger shared hosting (`https://antimprompt.com/upload_handler.php`).
 
-The original Instagram audit, `GET /ai-magic/insta-audit/{username}`, still uses RapidAPI. A second audit, `GET /ai-magic/insta-audit-v2/{username}`, reads public Business and Creator accounts from Meta's Instagram Graph API and does not call RapidAPI.
+The original Instagram audit, `GET /ai-magic/insta-audit/{username}`, still uses RapidAPI. A second audit, `GET /ai-magic/insta-audit-v2/{username}`, reads public Business and Creator accounts from Meta's Instagram Graph API and does not call RapidAPI. `GET /ai-magic/insta-audit-auto/{username}` tries Graph first and, when that cannot return a profile, falls back to RapidAPI.
 
 ## Local setup
 
@@ -27,9 +27,11 @@ Without `DATABASE_URL`, the app uses a local SQLite file (`promptverse.db`). Tha
 | `UPLOAD_HANDLER_KEY` | Yes (uploads) | Shared secret sent to Hostinger `upload_handler.php` |
 | `GEMINI_API_KEY` | Yes (Instagram audit and free AI tools) | Google Gemini API key. Use a free-tier key. |
 | `GROQ_API_KEY` | Optional | Groq free-tier fallback for Viral Insta Songs and Viral AI Art Trends |
-| `RAPIDAPI_KEY` or `INSTA_LOOTER_KEY` | Yes (RapidAPI audit) | RapidAPI Instagram Looter key |
-| `IG_GRAPH_ACCESS_TOKEN` | Yes (Graph v2 audit) | Long-lived Meta User access token |
-| `IG_BUSINESS_ACCOUNT_ID` | Yes (Graph v2 audit) | Numeric `instagram_business_account.id` (not the Facebook Page id) |
+| `RAPIDAPI_KEY` or `INSTA_LOOTER_KEY` | Yes, unless `RAPIDAPI_KEY_1`–`RAPIDAPI_KEY_10` is set | RapidAPI Instagram Looter key. Used after the numbered keys. |
+| `RAPIDAPI_KEY_1` … `RAPIDAPI_KEY_10` | Optional | Extra RapidAPI keys, tried in order when an earlier key is over its quota or rate limit. |
+| `RAPIDAPI_KEY_COOLDOWN_SECONDS` | Optional | How long an exhausted RapidAPI key is skipped. Default `60`. |
+| `IG_GRAPH_ACCESS_TOKEN` | Yes (Graph v2 and auto audit) | Long-lived Meta User access token |
+| `IG_BUSINESS_ACCOUNT_ID` | Yes (Graph v2 and auto audit) | Numeric `instagram_business_account.id` (not the Facebook Page id) |
 | `IG_GRAPH_API_VERSION` | Optional | Graph version; defaults to `v26.0` |
 | `DATABASE_URL` | On Render | Postgres URL (SQLite locally if unset) |
 | `CORS_ORIGINS` | Optional | Comma-separated allowed origins |
@@ -57,6 +59,16 @@ Returns `{"valid": true}` or `401`.
 The username is the only input. The server calls [Business Discovery](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-facebook-login/business-discovery/) on your own Instagram professional account, then runs the same Gemini audit, cache, and concurrency limit as the RapidAPI route. Follower gender is returned as unavailable because Business Discovery does not provide it.
 
 The target account must be a public Instagram Business or Creator account. Personal accounts, and accounts Business Discovery cannot see, get **404**. If either Instagram Graph variable is missing, the v2 route returns **500**.
+
+### Automatic audit
+
+`GET /ai-magic/insta-audit-auto/{username}`
+
+Same username rules as the other audit routes. The server tries Graph Business Discovery first. When Graph is configured and returns a public Business or Creator profile, the response is that audit with `"source": "graph"`. If Graph is not configured, errors, or the account is missing or not a Business or Creator account, the same request continues with RapidAPI and returns `"source": "rapidapi"`. A Graph failure is not sent to the client when RapidAPI succeeds.
+
+One uncached auto scan reserves the spend cap once, under the feature id `insta-audit-auto`, and calls Gemini at most once. A Graph miss does not also reserve `insta-audit-v2` or `insta-audit`. The result is cached on its own key (`auto:{username}`), separate from the v1 username key and the v2 `graph:{username}` key, and it uses the same `AUDIT_SEMAPHORE`.
+
+RapidAPI keys are read in this order: `RAPIDAPI_KEY_1` through `RAPIDAPI_KEY_10`, then `RAPIDAPI_KEY`, then `INSTA_LOOTER_KEY`. Duplicate values are skipped. HTTP 429, HTTP 403 whose body says the quota or subscription is used up, and a body that says the quota was exceeded or a rate limit was hit, try the next key. Any other error stops on that key. An exhausted key is remembered in memory and skipped for `RAPIDAPI_KEY_COOLDOWN_SECONDS` (default 60). When every configured key is exhausted, the response is HTTP 429 with exactly `we are getting too much request, please wait`. The v1 route accepts a numbered key on its own; it no longer requires the legacy `RAPIDAPI_KEY` name when one of `RAPIDAPI_KEY_1`–`RAPIDAPI_KEY_10` is set.
 
 ### Meta setup
 
@@ -94,7 +106,7 @@ What one successful scan does:
 
 1. Normalize the username (strip `@`, lowercase, allow only Instagram's `letters / digits / . / _` form).
 2. Check the hard budget. A spent cap returns `429` with `Limit reached, try tomorrow.` and stops here.
-3. Load the public profile. v1 calls RapidAPI Instagram Looter `GET /profile`. v2 calls Meta Business Discovery and does not use RapidAPI.
+3. Load the public profile. v1 calls RapidAPI Instagram Looter `GET /profile`. v2 calls Meta Business Discovery and does not use RapidAPI. The auto route calls Graph first and uses RapidAPI only when Graph does not return a profile.
 4. Skip Gemini when the account is private or missing. A private account returns `status: "private"` and no score.
 5. Keep the last 10 posts, compute average likes, comments, and engagement, and pass that JSON to Gemini with a fixed response schema. Follower gender is included only when the upstream payload already contains it. The model is told not to guess gender.
 6. Return `profile`, `recent_posts`, `engagement`, `follower_gender`, and `ai_audit` (overall score plus profile, content, engagement, consistency, growth, strengths, weaknesses, recommendations, content strategy, and hashtags).
@@ -107,12 +119,13 @@ Results for the same username are cached in memory (`AUDIT_CACHE_TTL`, default 6
 |---|---|---|
 | `GET /ai-magic/insta-audit/{username}` | RapidAPI `instagram-looter2` `/profile` | Whatever the scraper still returns for a public web profile. Personal and professional accounts are both attempted. |
 | `GET /ai-magic/insta-audit-v2/{username}` | `graph.facebook.com` Business Discovery | Public Instagram Business and Creator accounts only. Personal accounts are a 404. |
+| `GET /ai-magic/insta-audit-auto/{username}` | Graph first, then RapidAPI | `"source": "graph"` for a Business or Creator account. `"source": "rapidapi"` when Graph cannot return one. |
 
 The score text itself comes from Gemini (`GEMINI_API_KEY`, model chain `GEMINI_MODELS`). v2 still calls Gemini after the Graph read.
 
 ### Cost
 
-- **RapidAPI Instagram Looter** is a paid third-party subscription. Each uncached v1 scan is at least one billed `/profile` request, plus a Gemini generation. Marketplace quotas are small on the basic plan, and overage follows whatever subscription is attached to `RAPIDAPI_KEY`.
+- **RapidAPI Instagram Looter** is a paid third-party subscription. Each uncached v1 scan is at least one billed `/profile` request, plus a Gemini generation. Marketplace quotas are small on the basic plan, and overage follows whatever subscription is attached to the key that served the request. `RAPIDAPI_KEY_1` through `RAPIDAPI_KEY_10` are tried in order after a quota or rate-limit response, and `RAPIDAPI_KEY` / `INSTA_LOOTER_KEY` are extra keys. When every key is exhausted the API returns HTTP 429 with `we are getting too much request, please wait`.
 - **Gemini** is billed by Google when the key's project has billing turned on and usage passes the free tier. A free AI Studio key stays at the provider's free quota until that quota is exhausted. This app cannot see which of those two states the key is in.
 - **Groq** is not used by the score. It is the fallback for the two free tools below.
 - **Graph API** has no RapidAPI fee. Meta rate-limits it, and the long-lived token expires in about 60 days. The Gemini call can still cost money.
@@ -123,7 +136,7 @@ The hard budget below is what stops a busy day from calling RapidAPI, Graph, or 
 ### Risks that remain
 
 - Instagram Looter is an unofficial scraper. Instagram can change the payload, block the scraper, or serve an empty profile, and a scan then fails or scores thin data. Meta's terms restrict automated collection; v2 is the official read, limited to public professional accounts.
-- Provider rate limits surface as `429` (Graph) or `502` (RapidAPI / Gemini). The in-app cap is separate and is the one that returns `Limit reached, try tomorrow.`
+- Provider rate limits surface as `429` (Graph, or RapidAPI after every configured key is exhausted) or `502` (a non-quota RapidAPI or Gemini failure). The in-app cap is separate and is the one that returns `Limit reached, try tomorrow.` The all-keys RapidAPI response is `we are getting too much request, please wait`.
 - The audit cache lives in process memory. A restart or a second Render instance does its own lookups. Raise `AUDIT_CACHE_TTL` (seconds) when a one-minute cache is causing repeat RapidAPI charges.
 - A post with hidden like counts is stored as `0` and is included in the engagement average, so the rate can look lower than the visible posts.
 - Gender counts stay empty unless the upstream JSON already has them. Business Discovery never does.
@@ -212,7 +225,7 @@ Default batching is what makes 16 enough. Songs use `VIRAL_SONGS_BATCH_SIZE` (de
 | Art | 8 | 4 | 2 | 4 | 8 |
 | Total | 20 |  | 4 | 4 | 16 |
 
-`viral_browse.planned_daily_ai_calls()` recomputes that from the current settings. Interactive songs, art, and both audits still share the separate cap of 40 requests per day. Browse completions use `VIRAL_BROWSE_MAX_OUTPUT_TOKENS` (default 8192, clamped to 8192) because one call holds several categories. The interactive cap stays at `AI_MAX_OUTPUT_TOKENS`.
+`viral_browse.planned_daily_ai_calls()` recomputes that from the current settings. Interactive songs, art, and the Instagram audit routes still share the separate cap of 40 requests per day. Browse completions use `VIRAL_BROWSE_MAX_OUTPUT_TOKENS` (default 8192, clamped to 8192) because one call holds several categories. The interactive cap stays at `AI_MAX_OUTPUT_TOKENS`.
 
 ### Provider fallback
 
@@ -233,7 +246,7 @@ Uncached POST generations count against the caller IP, per feature, per UTC day.
 | Variable | Default | Applies to |
 |---|---|---|
 | `AI_FREE_USER_DAILY_LIMIT` | `5` | Viral Insta Songs, Viral AI Art Trends |
-| `AI_PAID_USER_DAILY_LIMIT` | `5` | both Instagram score routes |
+| `AI_PAID_USER_DAILY_LIMIT` | `5` | the three Instagram score routes (`insta-audit`, `insta-audit-v2`, `insta-audit-auto`) |
 
 The sixth uncached songs request from the same IP returns `429` `Limit reached, try tomorrow.` A repeat of an input that is still cached still returns the saved result. IPs are stored as a salted hash (`AI_LIMIT_SALT`). `0` on either limit blocks new uncached calls for that group.
 
@@ -257,13 +270,13 @@ If the budget database cannot be read or written, the request fails with `503` a
 
 ### Paid versus free
 
-`AI_FEATURE_BILLING` overrides the built-in flags, for example `viral-insta-songs:paid,insta-audit:free`. The score routes default to `paid` because they can spend RapidAPI and Gemini. The two new tools default to `free`. `AI_BLOCK_PAID_FEATURES=true` makes every paid tool return `403` `This feature is marked paid and is not available yet.` The default is `false`, so the score keeps working. Nothing in this API collects a payment.
+`AI_FEATURE_BILLING` overrides the built-in flags, for example `viral-insta-songs:paid,insta-audit:free`. The score routes default to `paid` (`insta-audit`, `insta-audit-v2`, and `insta-audit-auto`) because they can spend RapidAPI, Graph, and Gemini. The two new tools default to `free`. `AI_BLOCK_PAID_FEATURES=true` makes every paid tool return `403` `This feature is marked paid and is not available yet.` The default is `false`, so the score keeps working. Nothing in this API collects a payment. One auto scan counts as one request. A Graph miss does not reserve a second time before the RapidAPI attempt, and Gemini runs only for the source that returned a profile.
 
 ## Deploy on Render
 
 1. Connect this GitHub repo as a Web Service (or use `render.yaml`).
 2. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT` (also in `Procfile`).
-3. Set env vars on the Render service: `DATABASE_URL`, `ADMIN_KEY`, `UPLOAD_HANDLER_KEY`, `GEMINI_API_KEY`, `RAPIDAPI_KEY`, and for Graph v2 also `IG_GRAPH_ACCESS_TOKEN` + `IG_BUSINESS_ACCOUNT_ID`. Optionally set `CORS_ORIGINS`, `IG_GRAPH_API_VERSION`, `GROQ_API_KEY`, and the budget caps in the free-AI section. Leave the caps at the defaults on a small site; raise them only when the free-tier quota and the RapidAPI plan can absorb the extra calls.
+3. Set env vars on the Render service: `DATABASE_URL`, `ADMIN_KEY`, `UPLOAD_HANDLER_KEY`, `GEMINI_API_KEY`, and at least one of `RAPIDAPI_KEY` or `RAPIDAPI_KEY_1`–`RAPIDAPI_KEY_10`. For Graph v2 and the auto route also set `IG_GRAPH_ACCESS_TOKEN` + `IG_BUSINESS_ACCOUNT_ID`. Optionally set `CORS_ORIGINS`, `IG_GRAPH_API_VERSION`, `GROQ_API_KEY`, `RAPIDAPI_KEY_COOLDOWN_SECONDS`, and the budget caps in the free-AI section. Leave the caps at the defaults on a small site; raise them only when the free-tier quota and the RapidAPI plan can absorb the extra calls.
 4. Redeploy after changing secrets.
 
 ## Hostinger upload bridge
@@ -273,7 +286,7 @@ If the budget database cannot be read or written, the request fails with `503` a
 ## Tests
 
 ```bash
-python -m unittest tests.test_gemini_model_fallback tests.test_ig_graph_audit tests.test_free_ai tests.test_viral_browse -v
+python -m unittest tests.test_gemini_model_fallback tests.test_ig_graph_audit tests.test_free_ai tests.test_insta_audit_auto tests.test_viral_browse -v
 ```
 
 ## Image uploads

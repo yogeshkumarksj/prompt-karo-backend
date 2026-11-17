@@ -117,6 +117,7 @@ class FreeAiTests(unittest.TestCase):
         self.assertEqual(ai_gateway.feature_billing("viral-ai-art-trends"), "free")
         self.assertEqual(ai_gateway.feature_billing("insta-audit"), "paid")
         self.assertEqual(ai_gateway.feature_billing("insta-audit-v2"), "paid")
+        self.assertEqual(ai_gateway.feature_billing("insta-audit-auto"), "paid")
         os.environ["AI_FEATURE_BILLING"] = "viral-insta-songs:paid, insta-audit:free"
         self.assertEqual(ai_gateway.feature_billing("viral-insta-songs"), "paid")
         self.assertEqual(ai_gateway.feature_billing("insta-audit"), "free")

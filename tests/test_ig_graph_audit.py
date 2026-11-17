@@ -320,12 +320,27 @@ class GraphAuditTests(unittest.TestCase):
         get.assert_not_called()
 
     def test_rapidapi_route_still_reports_its_own_config_error(self):
+        names = (
+            "RAPIDAPI_KEY",
+            "INSTA_LOOTER_KEY",
+            *[f"RAPIDAPI_KEY_{index}" for index in range(1, 11)],
+        )
+        saved = {name: os.environ.get(name) for name in names}
+        for name in names:
+            os.environ.pop(name, None)
         main.RAPIDAPI_KEY = None
-        with patch.object(main.http_client, "get", AsyncMock()) as get:
-            response = self.client.get("/ai-magic/insta-audit/bluebottle")
-        self.assertEqual(response.status_code, 500)
-        self.assertIn("RAPIDAPI_KEY", response.json()["detail"])
-        get.assert_not_called()
+        try:
+            with patch.object(main.http_client, "get", AsyncMock()) as get:
+                response = self.client.get("/ai-magic/insta-audit/bluebottle")
+            self.assertEqual(response.status_code, 500)
+            self.assertIn("RAPIDAPI_KEY", response.json()["detail"])
+            get.assert_not_called()
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def test_cache_keys_do_not_mix_sources(self):
         async def run():

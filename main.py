@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 import ai_gateway
 import crud
+import viral_browse
 import models
 import schemas
 from database import engine, get_db
@@ -2225,6 +2226,18 @@ async def viral_insta_songs(body: ai_gateway.ViralSongsRequest, request: Request
     )
 
 
+@app.get("/ai-magic/viral-insta-songs/categories")
+async def viral_insta_song_categories():
+    """Fixed reel-song categories. Does not call a provider."""
+    return viral_browse.song_categories_payload()
+
+
+@app.get("/ai-magic/viral-insta-songs/top")
+async def viral_insta_songs_top(category: str):
+    """Cached top songs for one category or all. Not counted against the per-user limit."""
+    return await viral_browse.song_top(category)
+
+
 @app.post("/ai-magic/viral-ai-art-trends")
 async def viral_ai_art_trends(body: ai_gateway.ViralArtRequest, request: Request):
     """Free-tier AI image trends and original prompts. Cached, rate limited, and budget capped."""
@@ -2235,7 +2248,25 @@ async def viral_ai_art_trends(body: ai_gateway.ViralArtRequest, request: Request
     )
 
 
+@app.get("/ai-magic/viral-ai-art-trends/categories")
+async def viral_ai_art_categories():
+    """Fixed AI-art categories. Does not call a provider."""
+    return viral_browse.art_categories_payload()
+
+
+@app.get("/ai-magic/viral-ai-art-trends/browse")
+async def viral_ai_art_browse(category: str):
+    """Cached art trends for one category or all. Not counted against the per-user limit."""
+    return await viral_browse.art_browse(category)
+
+
+@app.on_event("startup")
+async def start_viral_browse_refresh():
+    viral_browse.maybe_start_background_refresh()
+
+
 @app.on_event("shutdown")
 async def shutdown_http_client():
+    await viral_browse.stop_background_refresh()
     await http_client.aclose()
     await ai_gateway.aclose()

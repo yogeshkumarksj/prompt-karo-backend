@@ -53,3 +53,16 @@ class AiResultCache(Base):
     payload = Column(Text, nullable=False)
     created_at = Column(Integer, nullable=False, index=True)
     expires_at = Column(Integer, nullable=False, index=True)
+
+
+class ViralBrowseCache(Base):
+    """Latest songs or art browse list for one category.
+
+    Rows stay after the refresh window so a failed refresh can still serve
+    the previous list. ``cache_key`` is ``songs:<category id>`` or ``art:<id>``.
+    """
+
+    __tablename__ = "viral_browse_cache"
+    cache_key = Column(String, primary_key=True)
+    payload = Column(Text, nullable=False)
+    generated_at = Column(Integer, nullable=False, index=True)

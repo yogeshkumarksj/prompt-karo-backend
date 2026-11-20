@@ -179,7 +179,11 @@ Edit the tuples in `viral_browse.py` to change the categories. `all` is not stor
 
 Every browse body includes the same disclaimer as the matching POST (`SONGS_DISCLAIMER` or `ART_DISCLAIMER`). `generated_at` is UTC. `stale` is true when the list is older than the refresh window because a refresh did not succeed. `refresh_hours` is the window that was used.
 
-A song row is `{rank, title, artist, hashtags, search_text, why_trending}`. `hashtags` is at most 6. `search_text` is `"<title> <artist>"` so it can be copied into search. Duplicate title + artist pairs are dropped after case and whitespace are folded. `category=all` keeps each song's `category` and `category_rank`, then assigns a new overall `rank` from 1. The same song in two categories appears once, under the earlier category.
+A song row is `{rank, title, artist, hashtags, search_text, why_trending, cover_url, preview_url, track_url, reels_count, reels_count_today, reels_count_source}`. `hashtags` is at most 6. `search_text` is `"<title> <artist>"` so it can be copied into search. Duplicate title + artist pairs are dropped after case and whitespace are folded. `category=all` keeps each song's `category` and `category_rank`, then assigns a new overall `rank` from 1. The same song in two categories appears once, under the earlier category.
+
+`cover_url` is album art from the public iTunes Search API (no key, no cost), looked up while the song list is refreshed and stored on the cached row. The 100px `artworkUrl100` value is rewritten to `600x600bb`. `preview_url` (30 second preview) and `track_url` (Apple Music page) are set only when that same lookup matches the title and artist; otherwise all three are `null` and the client shows a placeholder. A request that is still inside the refresh window does not call iTunes. The window is `VIRAL_SONGS_REFRESH_HOURS` or `VIRAL_REFRESH_HOURS` (default 6). The lookup is spaced to about 20 calls a minute (`VIRAL_SONG_ART_MIN_INTERVAL`, default 3 seconds) and finishes in the background, so the song list is returned before every cover is filled. `VIRAL_SONG_ART_INLINE=true` waits for the covers on that refresh. Cached rows written before these fields existed still serve; the new keys come back as `null`.
+
+`reels_count`, `reels_count_today`, and `reels_count_source` are always `null`. The list is not a live Instagram scan, and there is no free per-song Reel count to store. The model is told not to invent one.
 
 An art row is `{id, name, category, prompt, negative_prompt, why_it_works, image_url}`. There is no rank. `image_url` is an existing gallery file (`prompts.image_url` on `antimprompt.com`, or the host in `HOSTINGER_PUBLIC_BASE`) chosen by overlap with the prompt's category, tags, and title. A relative `/uploads/...` path is prefixed with that host. Anything else, including a URL that merely matches the words, stays `null` and the client draws a placeholder. The same gallery image is used once per response. No image model is called.
 
@@ -201,7 +205,13 @@ An art row is `{id, name, category, prompt, negative_prompt, why_it_works, image
       "artist": "Arijit Singh",
       "hashtags": ["bollywood", "reels"],
       "search_text": "Kesariya Arijit Singh",
-      "why_trending": "Wedding reels still open on this hook."
+      "why_trending": "Wedding reels still open on this hook.",
+      "cover_url": "https://is1-ssl.mzstatic.com/image/thumb/Music112/v4/9f/13/ca/9f13ca3b-e533-03e0-f19a-f0aaa774581d/196589311191.jpg/600x600bb.jpg",
+      "preview_url": "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview211/v4/38/4c/5c/384c5c8f-3ff8-e457-b2f7-3158ce108649/mzaf_example.m4a",
+      "track_url": "https://music.apple.com/us/album/kesariya-from-brahmastra/1635013814?i=1635014240&uo=4",
+      "reels_count": null,
+      "reels_count_today": null,
+      "reels_count_source": null
     }
   ]
 }

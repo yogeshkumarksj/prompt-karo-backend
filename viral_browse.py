@@ -178,7 +178,7 @@ def _hours_setting(specific: str) -> int:
         try:
             value = int(str(raw).strip())
         except ValueError:
-            value = 6
+            value = 24
     if value < 1:
         return 6
     return min(value, 168)

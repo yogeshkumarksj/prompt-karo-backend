@@ -348,7 +348,14 @@ class ViralBrowseTests(unittest.TestCase):
         self.assertEqual([song["rank"] for song in songs], list(range(1, 14)))
         shared = [song for song in songs if song["title"] == "Shared Anthem"]
         self.assertEqual(len(shared), 1)
-        self.assertEqual(shared[0]["category"], "trending")
+        self.assertEqual(songs[0]["title"], "Shared Anthem")
+        self.assertEqual(songs[0]["category"], "hindi-bollywood")
+        self.assertEqual(songs[1]["title"], "hindi-bollywood Only")
+        self.assertEqual(songs[2]["title"], "punjabi Only")
+        self.assertEqual(songs[2]["category"], "punjabi")
+        trending_only = next(song for song in songs if song["title"] == "trending Only")
+        self.assertGreater(trending_only["rank"], songs[2]["rank"])
+        self.assertEqual(shared[0]["category"], "hindi-bollywood")
         self.assertEqual(shared[0]["category_rank"], 1)
         self.assertEqual(shared[0]["rank"], 1)
         self.assertEqual(
@@ -834,6 +841,76 @@ class ViralBrowseTests(unittest.TestCase):
         picked = viral_browse.media_from_itunes_payload("Kesariya", "Arijit Singh", kesariya)
         self.assertEqual(picked["cover_url"], ART_600)
 
+        raatan = {
+            "resultCount": 2,
+            "results": [
+                {
+                    "kind": "song",
+                    "trackName": "Rattan Lamiyan",
+                    "artistName": "Kamal Khan",
+                    "artworkUrl100": REMIX_ART,
+                    "previewUrl": PREVIEW,
+                    "trackViewUrl": TRACK,
+                },
+                {
+                    "kind": "song",
+                    "trackName": 'Raataan Lambiyan (From "Shershaah")',
+                    "artistName": "Tanishk Bagchi, Jubin Nautiyal & Asees Kaur",
+                    "artworkUrl100": ART_100,
+                    "previewUrl": PREVIEW,
+                    "trackViewUrl": TRACK,
+                },
+            ],
+        }
+        matched = viral_browse.media_from_itunes_payload(
+            "Raatan Lambiyan", "Jasleen Royal & Jubin Nautiyal", raatan
+        )
+        self.assertEqual(matched["cover_url"], ART_600)
+        self.assertEqual(matched["preview_url"], PREVIEW)
+        wrong_artist = {
+            "resultCount": 1,
+            "results": [
+                {
+                    "kind": "song",
+                    "trackName": "Kya Baat Hai (feat. Pranjal Dahiya)",
+                    "artistName": "Bintu Pabra & Manisha Sharma",
+                    "artworkUrl100": ART_100,
+                    "previewUrl": PREVIEW,
+                    "trackViewUrl": TRACK,
+                }
+            ],
+        }
+        self.assertEqual(
+            viral_browse.media_from_itunes_payload("Kya Baat Hai", "Rashmeet Kaur", wrong_artist),
+            viral_browse.empty_song_media(),
+        )
+        senorita = {
+            "resultCount": 1,
+            "results": [
+                {
+                    "kind": "song",
+                    "trackName": "Señorita",
+                    "artistName": "Shawn Mendes & Camila Cabello",
+                    "artworkUrl100": ART_100,
+                    "previewUrl": PREVIEW,
+                    "trackViewUrl": TRACK,
+                }
+            ],
+        }
+        self.assertEqual(
+            viral_browse.media_from_itunes_payload(
+                "Senorita", "Shawn Mendes & Camila Cabello", senorita
+            )["cover_url"],
+            ART_600,
+        )
+        self.assertEqual(
+            viral_browse._artwork_queries("Raatan Lambiyan", "Jubin Nautiyal")[:2],
+            [
+                ("Raatan Lambiyan Jubin Nautiyal", "in"),
+                ("Raatan Lambiyan", "in"),
+            ],
+        )
+
     def test_artwork_rate_gate_spaces_calls(self):
         now = {"t": 0.0}
         sleeps = []
@@ -871,7 +948,7 @@ class ViralBrowseTests(unittest.TestCase):
     def test_same_song_is_looked_up_once(self):
         searches = []
 
-        async def fake_search(title, artist):
+        async def fake_search(title, artist, country=None, term=None):
             searches.append((title, artist))
             return self._itunes_payload(title, artist)
 
@@ -918,7 +995,7 @@ class ViralBrowseTests(unittest.TestCase):
         self._stop_artwork_patch()
         searches = []
 
-        async def fake_search(title, artist):
+        async def fake_search(title, artist, country=None, term=None):
             searches.append((title, artist))
             return self._itunes_payload(title, artist)
 
@@ -954,7 +1031,7 @@ class ViralBrowseTests(unittest.TestCase):
                         "search_text": f"{category['id']} Song Artist",
                         "why_trending": "Cached.",
                         "cover_url": None,
-                        "cover_source": "none",
+                        "cover_source": "miss",
                     }
                 ]
             viral_browse._cache_put(f"songs:{category['id']}", items, now)
@@ -982,11 +1059,96 @@ class ViralBrowseTests(unittest.TestCase):
         self.assertEqual(searches, [("Kesariya", "Arijit Singh")])
         self.assertFalse(any(key.startswith("browse:") for key in ai_gateway.usage_snapshot()))
 
+    def test_previous_itunes_miss_is_retried_once_without_a_model_call(self):
+        self._stop_artwork_patch()
+        searches = []
+
+        async def fake_search(title, artist, country=None, term=None):
+            searches.append((title, country))
+            if title == "Still Missing":
+                return {"resultCount": 0, "results": []}
+            return self._itunes_payload(title, artist)
+
+        now = viral_browse._now_ts()
+        viral_browse._cache_put(
+            "songs:trending",
+            [
+                {
+                    "rank": 1,
+                    "title": "Raatan Lambiyan",
+                    "artist": "Jubin Nautiyal",
+                    "hashtags": ["reels"],
+                    "search_text": "Raatan Lambiyan Jubin Nautiyal",
+                    "why_trending": "Still here.",
+                    "cover_url": None,
+                    "cover_source": "none",
+                },
+                {
+                    "rank": 2,
+                    "title": "Still Missing",
+                    "artist": "Nobody",
+                    "hashtags": ["reels"],
+                    "search_text": "Still Missing Nobody",
+                    "why_trending": "No catalog row.",
+                    "cover_url": None,
+                    "cover_source": "none",
+                },
+            ],
+            now,
+        )
+        for category in viral_browse.SONG_CATEGORIES[1:6]:
+            viral_browse._cache_put(
+                f"songs:{category['id']}",
+                [
+                    {
+                        "rank": 1,
+                        "title": f"{category['id']} Song",
+                        "artist": "Artist",
+                        "hashtags": ["reels"],
+                        "search_text": f"{category['id']} Song Artist",
+                        "why_trending": "Cached.",
+                        "cover_url": ART_600,
+                        "preview_url": PREVIEW,
+                        "track_url": TRACK,
+                        "cover_source": "itunes",
+                    }
+                ],
+                now,
+            )
+        viral_browse.drop_memory_for_tests()
+        with patch.object(viral_browse, "_itunes_search", fake_search):
+            first = self.client.get(
+                "/ai-magic/viral-insta-songs/top",
+                params={"category": "trending"},
+            )
+            second = self.client.get(
+                "/ai-magic/viral-insta-songs/top",
+                params={"category": "trending"},
+            )
+        songs = first.json()["songs"]
+        self.assertEqual(songs[0]["cover_url"], ART_600)
+        self.assertEqual(songs[0]["preview_url"], PREVIEW)
+        self.assertIsNone(songs[1]["cover_url"])
+        self.assertIsNone(songs[1]["preview_url"])
+        self.assertEqual(second.json()["generated_at"], first.json()["generated_at"])
+        self.assertEqual(
+            [title for title, _country in searches],
+            ["Raatan Lambiyan", "Still Missing", "Still Missing", "Still Missing", "Still Missing"],
+        )
+        self.assertFalse(any(key.startswith("browse:") for key in ai_gateway.usage_snapshot()))
+        with patch.object(viral_browse, "_itunes_search", fake_search):
+            third = self.client.get(
+                "/ai-magic/viral-insta-songs/top",
+                params={"category": "trending"},
+            )
+        self.assertEqual(len(searches), 5)
+        self.assertIsNone(third.json()["songs"][1]["cover_url"])
+
     def test_old_cache_without_new_fields_still_serves(self):
         self._stop_artwork_patch()
         searches = []
 
-        async def fake_search(title, artist):
+        async def fake_search(title, artist, country=None, term=None):
             searches.append(title)
             return self._itunes_payload(title, artist)
 
@@ -1089,7 +1251,7 @@ class ViralBrowseTests(unittest.TestCase):
     def test_itunes_rate_limit_serves_the_list_and_backs_off(self):
         searches = []
 
-        async def fake_search(title, artist):
+        async def fake_search(title, artist, country=None, term=None):
             searches.append(title)
             raise viral_browse.ArtworkRateLimit(429)
 
@@ -1201,7 +1363,7 @@ class ViralBrowseTests(unittest.TestCase):
     def _assert_artwork_follows_window(self, hours: int, early: int):
         searches = []
 
-        async def fake_search(title, artist):
+        async def fake_search(title, artist, country=None, term=None):
             searches.append((title, artist))
             return self._itunes_payload(title, artist)
 

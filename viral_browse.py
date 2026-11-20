@@ -29,6 +29,7 @@ import math
 import os
 import re
 import threading
+import unicodedata
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -436,9 +437,6 @@ def combine_trends(per_category: Sequence[Tuple[str, Sequence[dict]]]) -> List[d
 # finish before the song list is returned.
 
 _ARTWORK_UA = "PromptKaro/1.0 (viral song artwork; +https://antimprompt.com)"
-_ARTIST_STOP = {
-    "the", "a", "an", "and", "feat", "ft", "featuring", "vs", "versus", "with", "of", "x",
-}
 _VARIANT_RE = re.compile(
     r"\b(?:remix|live|lofi|lo fi|flip|karaoke|instrumental|acoustic|cover|"
     r"slowed|reverb|sped up|nightcore|unplugged|extended|dance mix|vocals only|"
@@ -539,13 +537,6 @@ def _art_interval() -> float:
     return min(value, 30.0)
 
 
-def _art_country() -> str:
-    raw = (os.getenv("VIRAL_SONG_ART_COUNTRY") or "us").strip().lower()
-    if re.fullmatch(r"[a-z]{2}", raw):
-        return raw
-    return "us"
-
-
 _ART_GATE = IntervalGate(_art_interval, monotonic=time_monotonic)
 
 
@@ -605,18 +596,27 @@ def _track_url(url: Any) -> Optional[str]:
 
 
 def _loose(text: str) -> str:
-    folded = (text or "").casefold().replace("&", " and ").replace("'", "").replace("’", "")
+    folded = unicodedata.normalize("NFKD", text or "")
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    folded = folded.casefold().replace("&", " and ").replace("'", "").replace("’", "")
     return " ".join(re.sub(r"[^a-z0-9]+", " ", folded).split())
+
+
+def _squash_repeats(text: str) -> str:
+    """Fold raatan/raataan and aathma/aathma raama into the same title key."""
+    return re.sub(r"(.)\1+", r"\1", text)
+
+
+_NAME_SPLIT = re.compile(
+    r"\s*(?:,|&|\bfeaturing\b|\bfeat\.?\b|\bft\.?\b|\bx\b|\band\b)\s*",
+    re.IGNORECASE,
+)
 
 
 def _core_title(text: str) -> str:
     without_groups = re.sub(r"[\(\[].*?[\)\]]", " ", text or "")
     head = re.split(r"\s+[-–—]\s+", without_groups, maxsplit=1)[0]
     return _loose(head)
-
-
-def _artist_tokens(text: str) -> set:
-    return {token for token in _loose(text).split() if token not in _ARTIST_STOP and len(token) > 1}
 
 
 def _is_variant(title: str) -> bool:
@@ -627,18 +627,36 @@ def _unknown_artist(artist: str) -> bool:
     return _loose(artist) in {"", "unknown", "unknown artist"}
 
 
+def _artist_names(text: str) -> List[str]:
+    """Names in a credit, split on & , feat, x, and."""
+    if _unknown_artist(text):
+        return []
+    names = []
+    for part in _NAME_SPLIT.split(text or ""):
+        name = _loose(part)
+        if len(name.replace(" ", "")) >= 3:
+            names.append(name)
+    return names
+
+
+def _name_in_artist(name: str, artist_name: str) -> bool:
+    haystack = f" {_loose(artist_name)} "
+    return f" {name} " in haystack
+
+
 def _match_itunes_song(title: str, artist: str, results: Sequence[dict]) -> Optional[dict]:
     """Pick a catalog row that is this song, not a loose first hit.
 
-    Remixes and live cuts stay as a fallback when the original is missing.
-    A different artist does not match.
+    The title must match after accents and doubled letters are folded and
+    a trailing "(From ...)" is removed. One named artist from a multi-artist
+    credit is enough. Remixes stay as a fallback when the original is missing.
     """
-    want_title = _loose(title)
-    want_core = _core_title(title)
+    want_title = _squash_repeats(_loose(title))
+    want_core = _squash_repeats(_core_title(title))
     if not want_title:
         return None
-    want_artist = _artist_tokens(artist)
-    unknown = _unknown_artist(artist)
+    names = _artist_names(artist)
+    unknown = not names
     best: Optional[dict] = None
     best_score = 0
     for item in results:
@@ -648,8 +666,8 @@ def _match_itunes_song(title: str, artist: str, results: Sequence[dict]) -> Opti
         if kind != "song":
             continue
         got_name = str(item.get("trackName") or "")
-        got_title = _loose(got_name)
-        got_core = _core_title(got_name)
+        got_title = _squash_repeats(_loose(got_name))
+        got_core = _squash_repeats(_core_title(got_name))
         if got_title == want_title:
             title_score = 10
         elif got_core and got_core == want_core:
@@ -661,16 +679,11 @@ def _match_itunes_song(title: str, artist: str, results: Sequence[dict]) -> Opti
                 continue
             score = title_score
         else:
-            got_artist = _artist_tokens(str(item.get("artistName") or ""))
-            overlap = want_artist & got_artist
-            if want_artist and want_artist <= got_artist:
-                artist_score = 6
-            elif len(overlap) >= min(2, len(want_artist)) and any(len(token) >= 4 for token in overlap):
-                artist_score = 3
-            else:
+            artist_name = str(item.get("artistName") or "")
+            if not any(_name_in_artist(name, artist_name) for name in names):
                 continue
             penalty = 5 if _is_variant(got_name) and not _is_variant(title) else 0
-            score = title_score + artist_score - penalty
+            score = title_score + 6 - penalty
         if score > best_score:
             best_score = score
             best = item
@@ -711,7 +724,9 @@ def _cover_pending(song: dict) -> bool:
         return False
     if "cover_source" not in song:
         return True
-    return song.get("cover_source") in (None, "")
+    # "none" is a miss from the previous matcher. Retry those once.
+    # "miss" means the current matcher already found nothing.
+    return song.get("cover_source") in (None, "", "none")
 
 
 def _assign_media(song: dict, media: dict, source: str) -> None:
@@ -748,7 +763,7 @@ def _apply_artwork_memo(by_id: Dict[str, list]) -> None:
             media = _artwork_memo_get(_song_key(song.get("title", ""), song.get("artist", "")))
             if media is None:
                 continue
-            source = "itunes" if _media_found(media) else "none"
+            source = "itunes" if _media_found(media) else "miss"
             _assign_media(song, media, source)
 
 
@@ -803,9 +818,33 @@ def _artwork_http() -> httpx.AsyncClient:
     return _artwork_client
 
 
-async def _itunes_search(title: str, artist: str) -> dict:
-    artist_text = "" if _unknown_artist(artist) else artist
-    term = " ".join(f"{title} {artist_text}".split())[:240]
+def _artwork_queries(title: str, artist: str) -> List[Tuple[str, str]]:
+    """India first, then the US. A title-only term follows the full credit.
+
+    The full "title + every artist" string often returns nothing for Indian
+    songs. The title alone still has to pass the artist check.
+    """
+    artist_text = "" if _unknown_artist(artist) else " ".join((artist or "").split())
+    full = " ".join(f"{title} {artist_text}".split())[:240]
+    title_only = " ".join((title or "").split())[:240]
+    terms = [full]
+    if title_only and title_only.casefold() != full.casefold():
+        terms.append(title_only)
+    pairs = []
+    for country in ("in", "us"):
+        for term in terms:
+            if term:
+                pairs.append((term, country))
+    return pairs
+
+
+async def _itunes_search(title: str, artist: str, country: Optional[str] = None, term: Optional[str] = None) -> dict:
+    if not term:
+        artist_text = "" if _unknown_artist(artist) else artist
+        term = " ".join(f"{title} {artist_text}".split())[:240]
+    store = (country or "in").strip().lower()
+    if not re.fullmatch(r"[a-z]{2}", store):
+        store = "in"
     response = await _artwork_http().get(
         "https://itunes.apple.com/search",
         params={
@@ -813,7 +852,7 @@ async def _itunes_search(title: str, artist: str) -> dict:
             "media": "music",
             "entity": "song",
             "limit": 8,
-            "country": _art_country(),
+            "country": store,
         },
     )
     if response.status_code in {403, 429}:
@@ -827,12 +866,16 @@ async def _itunes_search(title: str, artist: str) -> dict:
 
 async def _lookup_song_media(title: str, artist: str, key: str) -> dict:
     try:
-        if not await _ART_GATE.wait():
-            raise ArtworkRateLimit(429)
-        payload = await _itunes_search(title, artist)
-        media = media_from_itunes_payload(title, artist, payload)
-        _artwork_memo_put(key, media)
-        return media
+        found = empty_song_media()
+        for term, country in _artwork_queries(title, artist):
+            if not await _ART_GATE.wait():
+                raise ArtworkRateLimit(429)
+            payload = await _itunes_search(title, artist, country=country, term=term)
+            found = media_from_itunes_payload(title, artist, payload)
+            if _media_found(found):
+                break
+        _artwork_memo_put(key, found)
+        return found
     finally:
         with _artwork_state_lock:
             current = _artwork_inflight.get(key)
@@ -910,7 +953,7 @@ async def _enrich_category(category_id: str) -> None:
                 break
             continue
         failures = 0
-        source = "itunes" if _media_found(media) else "none"
+        source = "itunes" if _media_found(media) else "miss"
         if source == "itunes":
             found += len(group)
         for song in group:
@@ -1285,9 +1328,27 @@ def _category_rows(kind: str) -> List[Tuple[str, Optional[Tuple[int, list]]]]:
     return rows
 
 
+# Hindi and Punjabi lead the combined list. Per-category lists stay in
+# the order they were cached.
+_ALL_SONG_FIRST = ("hindi-bollywood", "punjabi")
+
+
+def _ordered_song_rows(rows: Sequence[Tuple[str, Optional[Tuple[int, list]]]]):
+    indexed = list(enumerate(rows))
+
+    def sort_key(item):
+        index, (category_id, _cached) = item
+        if category_id in _ALL_SONG_FIRST:
+            return (0, _ALL_SONG_FIRST.index(category_id), index)
+        return (1, index, index)
+
+    indexed.sort(key=sort_key)
+    return [(category_id, cached) for _index, (category_id, cached) in indexed]
+
+
 def _songs_payload(category_id: str) -> dict:
     if category_id == "all":
-        rows = _category_rows("songs")
+        rows = _ordered_song_rows(_category_rows("songs"))
         present = [(category_id_, cached[1]) for category_id_, cached in rows if cached and cached[1]]
         songs = combine_songs(present)
         if not songs:

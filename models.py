@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime
+from sqlalchemy import Column, Integer, LargeBinary, String, Text, DateTime
 from sqlalchemy.sql import func
 from database import Base
 
@@ -66,3 +66,19 @@ class ViralBrowseCache(Base):
     cache_key = Column(String, primary_key=True)
     payload = Column(Text, nullable=False)
     generated_at = Column(Integer, nullable=False, index=True)
+
+
+class ViralTemplate(Base):
+    """Admin-uploaded share card. Overlay PNG bytes live in Postgres, not on disk."""
+
+    __tablename__ = "viral_templates"
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    category = Column(String, nullable=True)
+    width = Column(Integer, nullable=False)
+    height = Column(Integer, nullable=False)
+    photo_box = Column(String, nullable=False)
+    text_box = Column(String, nullable=True)
+    text_color = Column(String, nullable=False, default="#FFFFFF")
+    overlay = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, index=True)

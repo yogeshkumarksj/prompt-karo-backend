@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 import ai_gateway
 import crud
+import story_card
 import viral_browse
 import models
 import schemas
@@ -85,6 +86,7 @@ if not os.path.exists(UPLOAD_ROOT):
     os.makedirs(UPLOAD_ROOT)
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
+app.include_router(story_card.router)
 
 models.Base.metadata.create_all(bind=engine)
 

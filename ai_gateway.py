@@ -51,7 +51,7 @@ DEFAULT_BILLING = {
     "viral-ai-art-trends": "free",
 }
 
-_MODEL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
+_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,80}$")
 _client_key: contextvars.ContextVar[str] = contextvars.ContextVar("ai_client_key", default="")
 # None uses AI_MAX_OUTPUT_TOKENS (clamped to 2048). Browse batches set a higher cap.
 _output_limit: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
@@ -336,9 +336,8 @@ def gemini_models() -> List[str]:
 def groq_models() -> List[str]:
     raw = os.getenv("GROQ_MODELS")
     if raw is None or not raw.strip():
-        raw = "llama-3.3-70b-versatile"
-    return _model_list(raw) or ["llama-3.3-70b-versatile"]
-
+        raw = "openai/gpt-oss-20b,openai/gpt-oss-120b"
+    return _model_list(raw) or ["openai/gpt-oss-20b"]
 
 def provider_order() -> List[str]:
     raw = os.getenv("AI_PROVIDER_ORDER")

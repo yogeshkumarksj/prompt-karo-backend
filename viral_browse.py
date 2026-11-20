@@ -319,8 +319,8 @@ def shape_songs(raw: Sequence[_BrowseSongIn]) -> List[dict]:
                 "cover_url": None,
                 "preview_url": None,
                 "track_url": None,
-                # Null means "not looked up yet". Legacy cache rows omit this key
-                # and keep serving without an artwork call.
+                # Null means "not looked up yet". Rows saved before this field
+                # existed omit the key and are backfilled the same way.
                 "cover_source": None,
                 "reels_count": None,
                 "reels_count_today": None,
@@ -702,7 +702,16 @@ def _media_found(media: dict) -> bool:
 
 
 def _cover_pending(song: dict) -> bool:
-    return isinstance(song, dict) and "cover_source" in song and song.get("cover_source") in (None, "")
+    """True until iTunes has been asked for this cached song.
+
+    Rows written before cover lookup omit ``cover_source``. Those still need
+    a lookup, and it must not wait for the next model refresh.
+    """
+    if not isinstance(song, dict):
+        return False
+    if "cover_source" not in song:
+        return True
+    return song.get("cover_source") in (None, "")
 
 
 def _assign_media(song: dict, media: dict, source: str) -> None:

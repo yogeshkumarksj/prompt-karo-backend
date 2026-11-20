@@ -1025,19 +1025,27 @@ class ViralBrowseTests(unittest.TestCase):
                 "/ai-magic/viral-insta-songs/top",
                 params={"category": "trending"},
             )
+            again = self.client.get(
+                "/ai-magic/viral-insta-songs/top",
+                params={"category": "trending"},
+            )
         self.assertEqual(response.status_code, 200, response.text)
         song = response.json()["songs"][0]
         self.assertEqual(song["title"], "Old Song")
         self.assertEqual(song["why_trending"], "Still here.")
         self.assertEqual(set(song.keys()), SONG_KEYS)
-        self.assertIsNone(song["cover_url"])
-        self.assertIsNone(song["preview_url"])
-        self.assertIsNone(song["track_url"])
+        self.assertEqual(song["cover_url"], ART_600)
+        self.assertEqual(song["preview_url"], PREVIEW)
+        self.assertEqual(song["track_url"], TRACK)
         self.assertIsNone(song["reels_count"])
         self.assertIsNone(song["reels_count_today"])
         self.assertIsNone(song["reels_count_source"])
-        self.assertEqual(searches, [])
+        self.assertEqual(searches.count("Old Song"), 1)
+        self.assertEqual(len(searches), 6)
+        self.assertEqual(again.json()["generated_at"], response.json()["generated_at"])
+        self.assertEqual(again.json()["songs"][0]["cover_url"], ART_600)
         self.assertFalse(response.json()["stale"])
+        self.assertFalse(any(key.startswith("browse:") for key in ai_gateway.usage_snapshot()))
 
     def test_model_cannot_invent_reel_counts_or_covers(self):
         def builder(prompt):

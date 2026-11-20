@@ -3,7 +3,13 @@
 Lists are generated with the free-tier provider fallback, several categories
 per call, and stored in ``viral_browse_cache``. A request serves the cache.
 The cache is refreshed when it is older than the refresh window (default 6
-hours). ``all`` is assembled from those caches and does not call the model.
+hours; ``VIRAL_REFRESH_HOURS`` or the per-chart override can set another
+window, including 24). ``all`` is assembled from those caches and does not
+call the model.
+
+Song covers are looked up from the public iTunes Search API as part of that
+same refresh, then stored on the cached row. A later request in the window
+does not call iTunes again. Reel usage counts are not guessed.
 
 Scheduled calls use the browse budget (``VIRAL_BROWSE_DAILY_REQUEST_CAP``,
 default 16) and do not spend the global request cap or a person's daily tries.
@@ -25,8 +31,9 @@ import re
 import threading
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import httpx
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -309,6 +316,15 @@ def shape_songs(raw: Sequence[_BrowseSongIn]) -> List[dict]:
                 "hashtags": _hashtags(item.hashtags),
                 "search_text": f"{title} {artist}",
                 "why_trending": ai_gateway._clip(item.why_trending, 160),
+                "cover_url": None,
+                "preview_url": None,
+                "track_url": None,
+                # Null means "not looked up yet". Legacy cache rows omit this key
+                # and keep serving without an artwork call.
+                "cover_source": None,
+                "reels_count": None,
+                "reels_count_today": None,
+                "reels_count_source": None,
             }
         )
         if len(shaped) >= SONGS_PER_CATEGORY:
@@ -367,18 +383,25 @@ def combine_songs(per_category: Sequence[Tuple[str, Sequence[dict]]]) -> List[di
             if not key or key in seen:
                 continue
             seen.add(key)
-            combined.append(
-                {
-                    "rank": len(combined) + 1,
-                    "category": category_id,
-                    "category_rank": song.get("rank"),
-                    "title": song.get("title", ""),
-                    "artist": song.get("artist", ""),
-                    "hashtags": list(song.get("hashtags") or []),
-                    "search_text": song.get("search_text") or "",
-                    "why_trending": song.get("why_trending") or "",
-                }
-            )
+            row = {
+                "rank": len(combined) + 1,
+                "category": category_id,
+                "category_rank": song.get("rank"),
+                "title": song.get("title", ""),
+                "artist": song.get("artist", ""),
+                "hashtags": list(song.get("hashtags") or []),
+                "search_text": song.get("search_text") or "",
+                "why_trending": song.get("why_trending") or "",
+                "cover_url": song.get("cover_url"),
+                "preview_url": song.get("preview_url"),
+                "track_url": song.get("track_url"),
+                "reels_count": None,
+                "reels_count_today": None,
+                "reels_count_source": None,
+            }
+            if "cover_source" in song:
+                row["cover_source"] = song.get("cover_source")
+            combined.append(row)
     return combined
 
 
@@ -402,6 +425,576 @@ def combine_trends(per_category: Sequence[Tuple[str, Sequence[dict]]]) -> List[d
                 }
             )
     return combined
+
+
+# --- Song artwork (iTunes Search) and reel-count placeholders ---
+#
+# Covers are fetched while a song list is refreshed, for whatever
+# VIRAL_SONGS_REFRESH_HOURS / VIRAL_REFRESH_HOURS is set to. They are not
+# fetched again on a cache hit. Apple documents about 20 Search calls per
+# minute, so lookups are spaced (default 3 seconds) and are not required to
+# finish before the song list is returned.
+
+_ARTWORK_UA = "PromptKaro/1.0 (viral song artwork; +https://antimprompt.com)"
+_ARTIST_STOP = {
+    "the", "a", "an", "and", "feat", "ft", "featuring", "vs", "versus", "with", "of", "x",
+}
+_VARIANT_RE = re.compile(
+    r"\b(?:remix|live|lofi|lo fi|flip|karaoke|instrumental|acoustic|cover|"
+    r"slowed|reverb|sped up|nightcore|unplugged|extended|dance mix|vocals only|"
+    r"radio edit|tribute|bootleg|mix|edit|version)\b",
+    re.IGNORECASE,
+)
+_ART_SIZE_RE = re.compile(r"/\d+x\d+(?:bb)?(?:-\d+)?(?=\.[A-Za-z0-9]+$)")
+
+_artwork_memo: Dict[str, Tuple[int, dict]] = {}
+_artwork_inflight: Dict[str, asyncio.Task] = {}
+_artwork_queue: List[str] = []
+_artwork_queued: set = set()
+_artwork_hold_until: Dict[str, int] = {}
+_artwork_task: Optional[asyncio.Task] = None
+_artwork_state_lock = threading.Lock()
+_artwork_client: Optional[httpx.AsyncClient] = None
+
+
+class ArtworkRateLimit(Exception):
+    """iTunes asked us to slow down. Remaining songs stay without a cover."""
+
+    def __init__(self, status: int):
+        super().__init__(f"itunes {status}")
+        self.status = status
+
+
+class IntervalGate:
+    """Space out calls. ``monotonic`` is injectable so tests do not sleep."""
+
+    def __init__(
+        self,
+        interval: Callable[[], float],
+        sleep: Optional[Callable[..., Any]] = None,
+        monotonic: Optional[Callable[[], float]] = None,
+    ):
+        self._interval = interval
+        self._sleep = sleep or asyncio.sleep
+        self._monotonic = monotonic or time_monotonic
+        self._lock = threading.Lock()
+        self._next = 0.0
+        self._stopped_until = 0.0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._next = 0.0
+            self._stopped_until = 0.0
+
+    def stop(self, seconds: float) -> None:
+        with self._lock:
+            until = float(self._monotonic()) + max(0.0, float(seconds))
+            if until > self._stopped_until:
+                self._stopped_until = until
+
+    def open(self) -> bool:
+        return float(self._monotonic()) >= self._stopped_until
+
+    async def wait(self) -> bool:
+        if not self.open():
+            return False
+        interval = self._interval()
+        with self._lock:
+            if not self.open():
+                return False
+            now = float(self._monotonic())
+            scheduled = max(now, self._next)
+            self._next = scheduled + interval
+            delay = scheduled - now
+        if delay > 0:
+            await self._sleep(delay)
+        return self.open()
+
+
+def time_monotonic() -> float:
+    return float(_now_ts())
+
+
+def _art_enabled() -> bool:
+    return ai_gateway._bool_env("VIRAL_SONG_ART_ENABLED", True)
+
+
+def _art_inline() -> bool:
+    """When true, the refresh waits for covers. Default is off so a long
+    window (for example 24 hours of songs) does not hold the HTTP request.
+    """
+    return ai_gateway._bool_env("VIRAL_SONG_ART_INLINE", False)
+
+
+def _art_interval() -> float:
+    raw = os.getenv("VIRAL_SONG_ART_MIN_INTERVAL")
+    if raw is None or not str(raw).strip():
+        return 3.0
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return 3.0
+    if value < 0:
+        return 3.0
+    return min(value, 30.0)
+
+
+def _art_country() -> str:
+    raw = (os.getenv("VIRAL_SONG_ART_COUNTRY") or "us").strip().lower()
+    if re.fullmatch(r"[a-z]{2}", raw):
+        return raw
+    return "us"
+
+
+_ART_GATE = IntervalGate(_art_interval, monotonic=time_monotonic)
+
+
+def empty_song_media() -> dict:
+    return {"cover_url": None, "preview_url": None, "track_url": None}
+
+
+def _host_is(host: str, root: str) -> bool:
+    return host == root or host.endswith("." + root)
+
+
+def _https_on_host(url: Any, allowed: Callable[[str], bool]) -> Optional[str]:
+    if not isinstance(url, str):
+        return None
+    raw = url.strip()
+    if not raw or len(raw) > 800 or raw.startswith("//"):
+        return None
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.username or parsed.password or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    if not allowed(host):
+        return None
+    if parsed.scheme == "http":
+        parsed = parsed._replace(scheme="https")
+    elif parsed.scheme != "https":
+        return None
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _upscale_artwork(url: Any) -> Optional[str]:
+    """Turn artworkUrl100 into a 600x600 image on Apple's CDN.
+
+    The public Search API only documents 60 and 100 pixel art. Replacing the
+    size token is what that CDN serves; a 100px URL that cannot be rewritten
+    is dropped so the UI can show a placeholder.
+    """
+    cleaned = _https_on_host(url, lambda host: _host_is(host, "mzstatic.com"))
+    if not cleaned:
+        return None
+    parsed = urllib.parse.urlsplit(cleaned)
+    path, replaced = _ART_SIZE_RE.subn("/600x600bb", parsed.path, count=1)
+    if replaced != 1:
+        return None
+    return urllib.parse.urlunsplit(parsed._replace(path=path))
+
+
+def _preview_url(url: Any) -> Optional[str]:
+    return _https_on_host(url, lambda host: _host_is(host, "itunes.apple.com"))
+
+
+def _track_url(url: Any) -> Optional[str]:
+    def allowed(host: str) -> bool:
+        return host in {"music.apple.com", "itunes.apple.com"} or host.endswith(".music.apple.com")
+
+    return _https_on_host(url, allowed)
+
+
+def _loose(text: str) -> str:
+    folded = (text or "").casefold().replace("&", " and ").replace("'", "").replace("’", "")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", folded).split())
+
+
+def _core_title(text: str) -> str:
+    without_groups = re.sub(r"[\(\[].*?[\)\]]", " ", text or "")
+    head = re.split(r"\s+[-–—]\s+", without_groups, maxsplit=1)[0]
+    return _loose(head)
+
+
+def _artist_tokens(text: str) -> set:
+    return {token for token in _loose(text).split() if token not in _ARTIST_STOP and len(token) > 1}
+
+
+def _is_variant(title: str) -> bool:
+    return _VARIANT_RE.search(title or "") is not None
+
+
+def _unknown_artist(artist: str) -> bool:
+    return _loose(artist) in {"", "unknown", "unknown artist"}
+
+
+def _match_itunes_song(title: str, artist: str, results: Sequence[dict]) -> Optional[dict]:
+    """Pick a catalog row that is this song, not a loose first hit.
+
+    Remixes and live cuts stay as a fallback when the original is missing.
+    A different artist does not match.
+    """
+    want_title = _loose(title)
+    want_core = _core_title(title)
+    if not want_title:
+        return None
+    want_artist = _artist_tokens(artist)
+    unknown = _unknown_artist(artist)
+    best: Optional[dict] = None
+    best_score = 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "song").casefold()
+        if kind != "song":
+            continue
+        got_name = str(item.get("trackName") or "")
+        got_title = _loose(got_name)
+        got_core = _core_title(got_name)
+        if got_title == want_title:
+            title_score = 10
+        elif got_core and got_core == want_core:
+            title_score = 7
+        else:
+            continue
+        if unknown:
+            if _is_variant(got_name) and not _is_variant(title):
+                continue
+            score = title_score
+        else:
+            got_artist = _artist_tokens(str(item.get("artistName") or ""))
+            overlap = want_artist & got_artist
+            if want_artist and want_artist <= got_artist:
+                artist_score = 6
+            elif len(overlap) >= min(2, len(want_artist)) and any(len(token) >= 4 for token in overlap):
+                artist_score = 3
+            else:
+                continue
+            penalty = 5 if _is_variant(got_name) and not _is_variant(title) else 0
+            score = title_score + artist_score - penalty
+        if score > best_score:
+            best_score = score
+            best = item
+    if best is None or best_score < 8:
+        return None
+    return best
+
+
+def media_from_itunes_payload(title: str, artist: str, payload: Any) -> dict:
+    """Cover and store links from one Search payload. No match yields nulls.
+
+    ``preview_url`` and ``track_url`` are set only from the same accepted row.
+    """
+    results = []
+    if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        results = payload["results"]
+    match = _match_itunes_song(title, artist, results)
+    if match is None:
+        return empty_song_media()
+    return {
+        "cover_url": _upscale_artwork(match.get("artworkUrl100") or match.get("artworkUrl60")),
+        "preview_url": _preview_url(match.get("previewUrl")),
+        "track_url": _track_url(match.get("trackViewUrl")),
+    }
+
+
+def _media_found(media: dict) -> bool:
+    return bool(media.get("cover_url") or media.get("preview_url") or media.get("track_url"))
+
+
+def _cover_pending(song: dict) -> bool:
+    return isinstance(song, dict) and "cover_source" in song and song.get("cover_source") in (None, "")
+
+
+def _assign_media(song: dict, media: dict, source: str) -> None:
+    song["cover_url"] = media.get("cover_url")
+    song["preview_url"] = media.get("preview_url")
+    song["track_url"] = media.get("track_url")
+    song["cover_source"] = source
+    # Counts are never copied from a lookup or from the model.
+    song["reels_count"] = None
+    song["reels_count_today"] = None
+    song["reels_count_source"] = None
+
+
+def _artwork_memo_get(key: str) -> Optional[dict]:
+    row = _artwork_memo.get(key)
+    if row is None:
+        return None
+    stored_at, media = row
+    # Same window as the song list, so a 6h default and a 24h deploy both
+    # look up again on the next refresh and not before it.
+    if _now_ts() - int(stored_at) >= _song_refresh_hours() * 3600:
+        _artwork_memo.pop(key, None)
+        return None
+    return copy.deepcopy(media)
+
+
+def _artwork_memo_put(key: str, media: dict) -> None:
+    _artwork_memo[key] = (_now_ts(), copy.deepcopy(media))
+
+
+def _apply_artwork_memo(by_id: Dict[str, list]) -> None:
+    for songs in by_id.values():
+        for song in songs:
+            media = _artwork_memo_get(_song_key(song.get("title", ""), song.get("artist", "")))
+            if media is None:
+                continue
+            source = "itunes" if _media_found(media) else "none"
+            _assign_media(song, media, source)
+
+
+def _public_song(song: dict) -> dict:
+    """Response row. Legacy cache rows gain the new keys as null.
+
+    Reel counts stay null until a real source is wired in. A number stored
+    in the cache, including one a model might have written, is not served.
+    ``cover_source`` stays internal.
+    """
+    if not isinstance(song, dict):
+        song = {}
+    tags = song.get("hashtags")
+    if not isinstance(tags, list):
+        tags = [] if tags is None else tags
+    item = {
+        "rank": song.get("rank"),
+        "title": song.get("title") or "",
+        "artist": song.get("artist") or "",
+        "hashtags": list(tags) if isinstance(tags, list) else tags,
+        "search_text": song.get("search_text") or "",
+        "why_trending": song.get("why_trending") or "",
+    }
+    if "category" in song:
+        item = {
+            "rank": item["rank"],
+            "category": song.get("category"),
+            "category_rank": song.get("category_rank"),
+            "title": item["title"],
+            "artist": item["artist"],
+            "hashtags": item["hashtags"],
+            "search_text": item["search_text"],
+            "why_trending": item["why_trending"],
+        }
+    item["cover_url"] = _upscale_artwork(song.get("cover_url"))
+    item["preview_url"] = _preview_url(song.get("preview_url"))
+    item["track_url"] = _track_url(song.get("track_url"))
+    item["reels_count"] = None
+    item["reels_count_today"] = None
+    item["reels_count_source"] = None
+    return item
+
+
+def _artwork_http() -> httpx.AsyncClient:
+    global _artwork_client
+    if _artwork_client is None:
+        _artwork_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=5.0),
+            follow_redirects=False,
+            headers={"User-Agent": _ARTWORK_UA, "Accept": "application/json"},
+        )
+    return _artwork_client
+
+
+async def _itunes_search(title: str, artist: str) -> dict:
+    artist_text = "" if _unknown_artist(artist) else artist
+    term = " ".join(f"{title} {artist_text}".split())[:240]
+    response = await _artwork_http().get(
+        "https://itunes.apple.com/search",
+        params={
+            "term": term,
+            "media": "music",
+            "entity": "song",
+            "limit": 8,
+            "country": _art_country(),
+        },
+    )
+    if response.status_code in {403, 429}:
+        raise ArtworkRateLimit(response.status_code)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("itunes payload")
+    return payload
+
+
+async def _lookup_song_media(title: str, artist: str, key: str) -> dict:
+    try:
+        if not await _ART_GATE.wait():
+            raise ArtworkRateLimit(429)
+        payload = await _itunes_search(title, artist)
+        media = media_from_itunes_payload(title, artist, payload)
+        _artwork_memo_put(key, media)
+        return media
+    finally:
+        with _artwork_state_lock:
+            current = _artwork_inflight.get(key)
+            if current is asyncio.current_task():
+                _artwork_inflight.pop(key, None)
+
+
+async def fetch_song_media(title: str, artist: str) -> dict:
+    """One polite iTunes lookup, shared by every category that names this song."""
+    key = _song_key(title, artist)
+    cached = _artwork_memo_get(key)
+    if cached is not None:
+        return cached
+    with _artwork_state_lock:
+        cached = _artwork_memo_get(key)
+        if cached is not None:
+            return cached
+        task = _artwork_inflight.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(_lookup_song_media(title, artist, key))
+            _artwork_inflight[key] = task
+    return await task
+
+
+def _artwork_held(category_id: str) -> bool:
+    return _now_ts() < _artwork_hold_until.get(category_id, 0)
+
+
+def _cache_put_if_same_generation(key: str, items: list, generated_at: int) -> bool:
+    current = _cache_get(key)
+    if current is None or int(current[0]) != int(generated_at):
+        return False
+    _cache_put(key, items, generated_at)
+    return True
+
+
+async def _enrich_category(category_id: str) -> None:
+    if _artwork_held(category_id):
+        return
+    cached = _cache_get(_cache_key("songs", category_id))
+    if cached is None or not cached[1]:
+        return
+    generated_at, songs = cached
+    if not any(_cover_pending(song) for song in songs):
+        return
+    groups: List[str] = []
+    members: Dict[str, list] = {}
+    for song in songs:
+        if not _cover_pending(song):
+            continue
+        key = _song_key(str(song.get("title") or ""), str(song.get("artist") or ""))
+        if key not in members:
+            members[key] = []
+            groups.append(key)
+        members[key].append(song)
+    failures = 0
+    found = 0
+    held = False
+    for key in groups:
+        group = members[key]
+        if not _ART_GATE.open():
+            held = True
+            break
+        try:
+            media = await fetch_song_media(group[0].get("title") or "", group[0].get("artist") or "")
+        except ArtworkRateLimit:
+            _ART_GATE.stop(60)
+            held = True
+            break
+        except Exception as exc:
+            print(f"Viral browse artwork lookup failed: {type(exc).__name__}")
+            failures += 1
+            if failures >= 3:
+                held = True
+                break
+            continue
+        failures = 0
+        source = "itunes" if _media_found(media) else "none"
+        if source == "itunes":
+            found += len(group)
+        for song in group:
+            _assign_media(song, media, source)
+        if not _cache_put_if_same_generation(_cache_key("songs", category_id), songs, generated_at):
+            return
+    if held:
+        _artwork_hold_until[category_id] = _now_ts() + _retry_seconds()
+    print(f"Viral browse artwork {category_id} covers={found}")
+
+
+def _category_has_pending(category_id: str) -> bool:
+    if _artwork_held(category_id):
+        return False
+    cached = _cache_get(_cache_key("songs", category_id))
+    if cached is None or not cached[1]:
+        return False
+    return any(_cover_pending(song) for song in cached[1])
+
+
+def _enqueue_categories(category_ids: Sequence[str]) -> Optional[asyncio.Task]:
+    global _artwork_task
+    if not _art_enabled():
+        return None
+    with _artwork_state_lock:
+        for category_id in category_ids:
+            if not category_id or category_id in _artwork_queued or _artwork_held(category_id):
+                continue
+            if not _category_has_pending(category_id):
+                continue
+            _artwork_queued.add(category_id)
+            _artwork_queue.append(category_id)
+        task = _artwork_task
+        if not _artwork_queue:
+            return task if task is not None and not task.done() else None
+        if task is None or task.done():
+            task = asyncio.create_task(_artwork_worker(), name="viral-song-artwork")
+            _artwork_task = task
+        return task
+
+
+async def _artwork_worker() -> None:
+    while True:
+        with _artwork_state_lock:
+            if not _artwork_queue:
+                return
+            category_id = _artwork_queue.pop(0)
+        try:
+            await _enrich_category(category_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Viral browse artwork failed: {type(exc).__name__}")
+        finally:
+            with _artwork_state_lock:
+                _artwork_queued.discard(category_id)
+
+
+def _pending_categories() -> List[str]:
+    if not _art_enabled():
+        return []
+    return [item["id"] for item in SONG_CATEGORIES if _category_has_pending(item["id"])]
+
+
+async def _finish_pending_artwork() -> None:
+    task = _enqueue_categories(_pending_categories())
+    if _art_inline() and task is not None:
+        await task
+
+
+async def finish_artwork_tasks() -> None:
+    """Wait for the artwork worker. Tests use this when inline mode is off."""
+    task = _artwork_task
+    if task is not None and not task.done():
+        await task
+
+
+def _clear_artwork_state() -> None:
+    global _artwork_task
+    task = _artwork_task
+    _artwork_task = None
+    if task is not None and not task.done():
+        try:
+            task.cancel()
+        except RuntimeError:
+            pass
+    with _artwork_state_lock:
+        _artwork_queue.clear()
+        _artwork_queued.clear()
+        _artwork_inflight.clear()
+    _artwork_memo.clear()
+    _artwork_hold_until.clear()
+    _ART_GATE.reset()
 
 
 def _cache_key(kind: str, category_id: str) -> str:
@@ -499,7 +1092,7 @@ Rules:
 - For each category return up to {SONGS_PER_CATEGORY} songs, best first. List order is the rank. Do not add a rank field.
 - Use real, widely known titles and artists. If you are unsure, skip the track.
 - Do not repeat the same title and artist inside a category.
-- why_trending is one short sentence under 12 words. No lyrics, chords, stream counts, chart positions, or dates.
+- why_trending is one short sentence under 12 words. No lyrics, chords, stream counts, chart positions, dates, image URLs, preview links, or reel counts.
 - hashtags is up to {HASHTAG_LIMIT} single-word tags without the # character.
 - Keep the JSON compact so every category fits in one response.
 - If a category would require sexual content involving minors, scams, or illegal activity, return an empty songs list for that category.
@@ -576,9 +1169,15 @@ async def _generate_batch(kind: str, categories: Sequence[Dict[str, str]]) -> No
             by_id[category_id] = shape_trends(category_id, row.trends)
 
     generated_at = _now_ts()
+    if kind == "songs":
+        _apply_artwork_memo(by_id)
     for category in categories:
         _save_category(kind, category["id"], by_id.get(category["id"], []), generated_at)
     print(f"Viral browse {kind} batch saved via {provider}/{model} categories={','.join(expected)}")
+    if kind == "songs":
+        task = _enqueue_categories([category["id"] for category in categories])
+        if _art_inline() and task is not None:
+            await task
 
 
 async def _refresh_batch(kind: str, categories: Sequence[Dict[str, str]], key: str) -> None:
@@ -698,7 +1297,7 @@ def _songs_payload(category_id: str) -> dict:
             stale=any(_is_stale(stamp, _song_refresh_hours()) for stamp in timestamps),
         )
         body["missing_categories"] = missing
-        body["songs"] = songs
+        body["songs"] = [_public_song(song) for song in songs]
         return body
 
     cached = _cache_get(_cache_key("songs", category_id))
@@ -711,7 +1310,7 @@ def _songs_payload(category_id: str) -> dict:
         generated_at=generated_at,
         stale=_is_stale(generated_at, _song_refresh_hours()),
     )
-    body["songs"] = songs
+    body["songs"] = [_public_song(song) for song in songs]
     return body
 
 
@@ -891,6 +1490,7 @@ async def song_top(category: str) -> dict:
         await _ensure_kind("songs")
     else:
         await _ensure_batch("songs", _batch_index("songs", category_id))
+    await _finish_pending_artwork()
     return _songs_payload(category_id)
 
 
@@ -971,6 +1571,7 @@ def drop_memory_for_tests() -> None:
 
 
 def reset_state_for_tests() -> None:
+    _clear_artwork_state()
     drop_memory_for_tests()
     models.Base.metadata.create_all(bind=engine, tables=[models.ViralBrowseCache.__table__])
     db = SessionLocal()

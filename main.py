@@ -26,6 +26,7 @@ import ai_gateway
 import crud
 import story_card
 import viral_browse
+import viral_templates
 import models
 import schemas
 from database import engine, get_db
@@ -87,6 +88,7 @@ if not os.path.exists(UPLOAD_ROOT):
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 app.include_router(story_card.router)
+app.include_router(viral_templates.router)
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -2572,6 +2574,7 @@ async def viral_ai_art_browse(category: str):
 @app.on_event("startup")
 async def start_viral_browse_refresh():
     viral_browse.maybe_start_background_refresh()
+    viral_templates.ensure_seeded()
 
 
 @app.on_event("shutdown")
